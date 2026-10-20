@@ -1,0 +1,66 @@
+# Config SFT por etapas para Qwen3-8B en una RTX 4060 Laptop (8 GB VRAM, ~32 GB RAM).
+#
+# Cómo usarla (detalle en entrenamiento/README.md, §4-§5):
+#   1. Pon en `data.train` la lista de archivos de la etapa (o uno solo, en modo archivo a archivo)
+#      y en `output` una carpeta nueva.
+#   2. Desde la etapa 2: `base` = modelo fusionado de la etapa anterior y `data.replay` = acumulado.
+#   3. soup doctor --config entrenamiento/soup.yaml   # qué lee y qué no lee este task/backend
+#   4. soup train  --config entrenamiento/soup.yaml --dry-run   # valida y estima sin cargar pesos
+#   5. soup train  --config entrenamiento/soup.yaml
+#
+# Diseño: layer streaming + NF4. La base congelada vive en RAM (~6 GB page-locked para Qwen3-8B)
+# y solo una capa cada vez pasa a VRAM. La palanca de memoria es la longitud de secuencia:
+# ~1.25 GB por cada 512 tokens (vocabulario de 152k). Estimador de Soup para esta config:
+#   max_length 1536 -> ~6.0 GB · 1792 -> ~6.6 GB · 2048 -> ~7.25 GB (RTX 4060 Laptop: ~7.5 GB libres
+#   si la pantalla va por la iGPU). Las filas de estos datasets miden ~1100 tokens de mediana:
+#   con 1024 se truncaría el 64 %, con 1792 ~8 %, con 2048 ~4 % (cuéntalo de verdad con
+#   `python entrenamiento/_fuentes/contar_tokens.py`).
+# Es el camino medido en el repo para 8B en 4 GB y 14B en 8 GB (benchmarks/gate-901-14b-on-8gb.md).
+
+base: Qwen/Qwen3-8B
+task: sft
+backend: transformers
+modality: text
+
+data:
+  train:                      # etapa 1 completa, en orden (modo archivo a archivo: un solo path)
+    - ./entrenamiento/01_espanol/01_gramatica_ortografia.jsonl
+    - ./entrenamiento/01_espanol/02_conversacion_registros.jsonl
+    - ./entrenamiento/01_espanol/03_redaccion_resumen_explicacion.jsonl
+    - ./entrenamiento/01_espanol/04_espanol_tecnico_traduccion.jsonl
+  interleave: {strategy: concat}   # quítalo si `train` es un solo archivo
+  format: chatml
+  val_split: 0.1
+  max_length: 2048            # si el pre-flight lo rechaza: 1792 (o lora.r: 8, que libera ~0.35 GB)
+  train_on_responses_only: true
+  # Rehearsal anti-olvido a partir de la etapa 2: mezcla un 20 % de filas de etapas previas.
+  # replay: ./entrenamiento/_replay/acumulado.jsonl
+  # replay_ratio: 0.2
+  # replay_seed: 0
+
+training:
+  epochs: 3
+  lr: 2.0e-4                  # LoRA sobre base cuantizada: 1e-4..2e-4 es lo habitual
+  batch_size: 1               # con stream_layers no se admite 'auto'
+  gradient_accumulation_steps: 8   # por etapa; en modo archivo a archivo usa 4
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  scheduler: cosine
+  seed: 42
+  logging_steps: 5
+  save_steps: 50
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: auto      # peft elige las proyecciones lineales de atención/MLP
+  quantization: 4bit          # NF4 (bitsandbytes); con streaming se cuantiza una vez a un caché de shards
+  stream_layers: true         # BETA, pero es el camino medido para 8B en tarjetas pequeñas
+  stream_source: auto         # RAM si cabe (cabe: ~6 GB), NVMe si no
+  stream_buffers: 2
+  stream_vram_probe: true     # decide el ajuste midiendo un paso real, no con la fórmula (solo sft)
+  rewind_log: true            # soup rewind nombra las filas que disparan la pérdida
+
+output: ./runs/etapa_1
+experiment_name: etapa_1

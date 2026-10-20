@@ -1,0 +1,37 @@
+# OPCIONAL / AVANZADO — refuerzo de razonamiento verificable con GRPO.
+#
+# GRPO NO puede usar layer streaming (está excluido) y en 8 GB un 8B residente en NF4 con
+# generación de 4 completaciones por prompt no cabe con holgura. Dos salidas realistas:
+#   a) backend: unsloth (pip install "soup-cli[fast]"): menos VRAM; instalar en Windows es delicado.
+#   b) base más pequeño (Qwen/Qwen3-4B o el modelo fusionado de la etapa anterior si es ≤4B).
+# Ejecuta SIEMPRE antes: soup train --config entrenamiento/soup_grpo.yaml --dry-run
+#
+# Datos: entrenamiento/03_razonamiento/05_grpo_verificable.jsonl (alpaca; el `output` termina en
+# `#### <respuesta>`, que es lo que lee el reward `accuracy`).
+
+base: ./modelos/final            # modelo fusionado tras las etapas SFT (o Qwen/Qwen3-4B)
+task: grpo
+backend: transformers            # o unsloth
+
+data:
+  train: ./entrenamiento/03_razonamiento/05_grpo_verificable.jsonl
+  format: alpaca
+  max_length: 1024
+
+training:
+  epochs: 2
+  lr: 1.0e-5
+  batch_size: 4                  # múltiplo de num_generations
+  gradient_accumulation_steps: 4
+  quantization: 4bit
+  gradient_checkpointing: true
+  grpo_beta: 0.05
+  num_generations: 4
+  reward_fn: "accuracy,format"   # respuesta correcta + estructura <think>…</think> (ensemble)
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: auto
+
+output: ./runs/grpo_razonamiento

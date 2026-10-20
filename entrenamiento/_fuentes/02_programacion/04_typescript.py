@@ -1,0 +1,2776 @@
+"""TypeScript 5.x: sistema de tipos, configuración, validación en la frontera y migración desde JS.
+
+30 filas. Temas: tipado estructural y excess property checks, narrowing y predicados de tipo,
+uniones discriminadas y exhaustividad con never, genéricos con restricciones, utility types,
+infer y tipos condicionales, template literal types, satisfies, enums frente a uniones con
+as const, flags de strict, archivos .d.ts, zod y valibot para JSON, unknown en catch, non-null
+assertion, moduleResolution y paths, tuplas variádicas, branded types, JSDoc con checkJs,
+migración gradual, tipos recursivos, overloads, type frente a interface, objetos que crecen,
+mapped types con remapeo de claves, indexación con string, tipado de async, emisor de eventos
+tipado, verbatimModuleSyntax y clases.
+"""
+
+SISTEMA = (
+    "Eres un asistente experto en programación, análisis y razonamiento. Respondes en el "
+    "idioma del usuario (español por defecto), con precisión y sin relleno, y verificas tu "
+    "trabajo antes de responder."
+)
+
+ROWS = [
+    # 1) Tipado estructural y comprobación de propiedades de más (intermedio, SISTEMA)
+    {
+        "messages": [
+            {"role": "system", "content": SISTEMA},
+            {
+                "role": "user",
+                "content": """¿Por qué TypeScript me deja pasar un objeto con propiedades de más en un caso y en otro no?
+
+```ts
+interface Point { x: number; y: number }
+
+function draw(p: Point) { console.log(p.x, p.y); }
+
+const p3 = { x: 1, y: 2, z: 3 };
+draw(p3);                   // compila
+draw({ x: 1, y: 2, z: 3 }); // Object literal may only specify known properties, and 'z' does not exist in type 'Point'.
+```""",
+            },
+            {
+                "role": "assistant",
+                "content": """Son dos reglas distintas que conviven.
+
+**1. El sistema de tipos es estructural.** Un valor es compatible con `Point` si tiene **al menos** `x: number` e `y: number`. No importa cómo se llame su tipo ni si tiene más propiedades: `{ x, y, z }` es un subtipo de `Point`. Por eso `draw(p3)` compila.
+
+**2. La comprobación de propiedades de más (*excess property check*)** es una regla adicional, casi un linter, que solo se aplica a **literales de objeto «frescos»**: los que escribes directamente donde se espera un tipo. Ahí una propiedad que el tipo no conoce casi siempre es una errata, así que TypeScript la señala. En cuanto el literal se guarda en una variable, deja de ser fresco y la regla ya no aplica.
+
+Donde más ayuda es con propiedades opcionales, en las que una errata no provocaría ningún otro error:
+
+```ts
+interface Options { color?: string; verbose?: boolean }
+
+const ok: Options = { color: 'red' };
+const typo: Options = { colour: 'red' }; // error: 'colour' does not exist in type 'Options'
+```
+
+Hay una tercera regla parecida, la de los **tipos débiles** (todas sus propiedades son opcionales): asignarles un objeto que no comparte **ninguna** propiedad con ellos es un error, aunque no sea un literal fresco.
+
+```ts
+const raw = { colour: 'red' };
+const opts: Options = raw; // error: Type '{ colour: string; }' has no properties in common with type 'Options'.
+```
+
+**La consecuencia práctica que más importa: los tipos no son exactos.** En tiempo de ejecución un objeto tipado como `Point` puede llevar propiedades extra. Eso tiene un riesgo real en las respuestas de una API:
+
+```ts
+interface PublicUser { id: string; name: string }
+
+function toResponseBody(user: PublicUser): string {
+  return JSON.stringify(user);
+}
+
+const dbUser = { id: '1', name: 'Ana', passwordHash: '$2b$10$abc' };
+toResponseBody(dbUser); // compila, y el hash sale en el JSON
+```
+
+El tipo no filtra campos: solo describe un mínimo. Para una respuesta pública, construye el objeto campo a campo, o valida con un esquema que descarte lo desconocido:
+
+```ts
+function toResponseBody(user: PublicUser): string {
+  return JSON.stringify({ id: user.id, name: user.name });
+}
+```
+
+Esto también explica por qué `Object.keys(point)` devuelve `string[]` y no `('x' | 'y')[]`: TypeScript no puede garantizar que no haya más claves.
+
+Comprobación: con tu ejemplo y estos fragmentos en un archivo (solo la primera versión de `toResponseBody`), `npx tsc --noEmit` debe dar exactamente tres errores: el literal con `z`, el de `colour` y el de `raw`. La llamada `toResponseBody(dbUser)` compila, y eso es justo lo que demuestra el riesgo.""",
+            },
+        ]
+    },
+    # 2) Narrowing: filter(Boolean), predicados inferidos (TS 5.5) y guards propios (principiante-intermedio)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": """¿por qué después del filter TS sigue diciendo que puede ser undefined?
+
+```ts
+const ids: (string | undefined)[] = ['a', undefined, 'b'];
+const clean = ids.filter(Boolean);
+clean[0].toUpperCase(); // 'clean[0]' is possibly 'undefined'.
+```""",
+            },
+            {
+                "role": "assistant",
+                "content": """Porque `filter` solo estrecha el tipo cuando su callback es un **predicado de tipo** (una función cuyo tipo de retorno es `value is S`). La firma relevante de la librería estándar es:
+
+```ts
+filter<S extends T>(predicate: (value: T, index: number, array: T[]) => value is S): S[];
+```
+
+`Boolean` está tipado como una función que devuelve `boolean` a secas, no `value is string`. Para el compilador, `filter(Boolean)` es un filtro cualquiera y el resultado conserva el tipo `(string | undefined)[]`.
+
+**Desde TypeScript 5.5**, el compilador infiere el predicado a partir de una flecha sencilla:
+
+```ts
+const clean = ids.filter((id) => id !== undefined); // string[]
+clean[0].toUpperCase(); // compila
+```
+
+En versiones anteriores, escribe el predicado a mano:
+
+```ts
+const clean = ids.filter((id): id is string => id !== undefined);
+```
+
+Un detalle sobre por qué `filter(Boolean)` no se arreglaría ni con un tipo mejor: además de `undefined`, descarta `''`. Un predicado tiene que ser exacto en las dos direcciones («si devuelve `false`, el valor **no** es `string`»), y eso no se cumple. Por la misma razón, TS 5.5 no infiere nada para `(id) => !!id`.
+
+Las herramientas de narrowing que usarás a diario:
+
+```ts
+type Input = string | number | Date | { code: number };
+
+function describe(value: Input): string {
+  if (typeof value === 'string') return value.toUpperCase(); // string
+  if (typeof value === 'number') return value.toFixed(2);    // number
+  if (value instanceof Date) return value.toISOString();     // Date
+  return `código ${value.code}`;                             // solo queda { code: number }
+}
+```
+
+Y cuando necesitas comprobar la forma de algo que llega de fuera, un guard propio:
+
+```ts
+interface ApiError { code: number; message: string }
+
+function isApiError(value: unknown): value is ApiError {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'code' in value && typeof value.code === 'number' &&
+    'message' in value && typeof value.message === 'string'
+  );
+}
+```
+
+Ojo: un predicado es una **promesa** que le haces al compilador. Si el cuerpo comprueba mal, TypeScript te cree igualmente y el error aparecerá en ejecución. Por eso los guards se prueban:
+
+```ts
+console.assert(isApiError({ code: 404, message: 'no existe' }) === true);
+console.assert(isApiError({ code: '404', message: 'no existe' }) === false);
+console.assert(isApiError(null) === false);
+```
+
+Y la comprobación de tipos del primer caso: `const check: string[] = ids.filter((id) => id !== undefined);` debe compilar con TS 5.5 o superior.""",
+            },
+        ]
+    },
+    # 3) Uniones discriminadas y exhaustividad con never (intermedio, multiturno)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": """Estoy modelando el estado de una petición así y tengo `?` por todos lados:
+
+```ts
+interface RequestState {
+  loading: boolean;
+  data?: User[];
+  error?: string;
+}
+```
+
+Siempre acabo escribiendo `if (state.data && !state.loading && !state.error)`. ¿Hay una forma mejor?""",
+            },
+            {
+                "role": "assistant",
+                "content": """Sí: una **unión discriminada**. Tu interfaz permite 8 combinaciones (`loading` verdadero o falso, con o sin `data`, con o sin `error`), pero solo 4 tienen sentido. Las otras 4 son estados imposibles («cargando, con datos y con error») que el tipo deja construir y que tu código tiene que defender con esos `if`.
+
+La alternativa es describir cada estado con exactamente sus campos, y una propiedad común con un literal distinto (el **discriminante**) que los identifica:
+
+```ts
+interface User { id: string; name: string }
+
+type RequestState<T> =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'success'; data: T }
+  | { status: 'error'; error: string };
+
+function render(state: RequestState<User[]>): string {
+  switch (state.status) {
+    case 'idle':
+      return 'Busca un usuario';
+    case 'loading':
+      return 'Cargando…';
+    case 'success':
+      return state.data.map((user) => user.name).join(', '); // aquí data existe seguro
+    case 'error':
+      return `Error: ${state.error}`;
+  }
+}
+```
+
+Qué ganas:
+
+- Dentro de cada `case`, TypeScript estrecha `state` a esa variante: `state.data` solo existe en `'success'` y no hay `?` que comprobar.
+- Los estados imposibles no se pueden escribir: `{ status: 'loading', error: 'x' }` es un error de compilación.
+- Las transiciones quedan explícitas: pasar a `'success'` **obliga** a aportar `data`.
+
+Requisito: el discriminante debe ser una propiedad presente en todas las variantes, con un tipo literal (`'idle'`, `'loading'`...), no `string`.""",
+            },
+            {
+                "role": "user",
+                "content": "Me convenció. Pero si mañana alguien añade `{ status: 'cancelled' }`, ¿cómo me aseguro de que no se olvide de tratarlo en todos los switch?",
+            },
+            {
+                "role": "assistant",
+                "content": """Con una **comprobación de exhaustividad** basada en `never`. Si el `switch` cubre todas las variantes, en el `default` el tipo de `state` queda reducido a `never` (no queda ninguna posibilidad). Si alguien añade una variante y no la trata, en el `default` ya no es `never` y la llamada deja de compilar.
+
+```ts
+function assertNever(value: never): never {
+  throw new Error(`Estado no contemplado: ${JSON.stringify(value)}`);
+}
+
+function render(state: RequestState<User[]>): string {
+  switch (state.status) {
+    case 'idle':
+      return 'Busca un usuario';
+    case 'loading':
+      return 'Cargando…';
+    case 'success':
+      return state.data.map((user) => user.name).join(', ');
+    case 'error':
+      return `Error: ${state.error}`;
+    default:
+      return assertNever(state);
+  }
+}
+```
+
+Al añadir `| { status: 'cancelled' }` al tipo, cada `switch` sin ese caso falla con:
+
+```
+Argument of type '{ status: "cancelled"; }' is not assignable to parameter of type 'never'.
+```
+
+El mensaje dice exactamente qué variante falta.
+
+Por qué un helper que **lanza** y no solo una comprobación de tipos: los tipos no existen en ejecución. Si el estado viene de una API o de `localStorage` con un `status` que tu versión del cliente no conoce, el `throw` falla en voz alta en lugar de devolver `undefined` en silencio.
+
+Tres matices:
+
+- En una función con tipo de retorno explícito, TypeScript ya avisa si falta un caso (`Function lacks ending return statement...`). Pero en funciones `void`, en cadenas de `if` o en `switch` que solo ejecutan efectos, ese aviso no existe; `assertNever` funciona en todos los casos.
+- Si usas `typescript-eslint`, la regla `@typescript-eslint/switch-exhaustiveness-check` señala los `switch` incompletos incluso sin `default`.
+- No pongas `default: return 'desconocido'` «por si acaso»: desactiva la comprobación y vuelves al punto de partida.
+
+Comprobación en ejecución:
+
+```ts
+import assert from 'node:assert/strict';
+
+assert.equal(render({ status: 'error', error: 'timeout' }), 'Error: timeout');
+assert.throws(() => render({ status: 'cancelled' } as never), /no contemplado/);
+```
+
+Y la de tipos: añade la variante `'cancelled'` en una rama, ejecuta `npx tsc --noEmit` y comprueba que aparece un error por cada `switch` que falta actualizar.""",
+            },
+        ]
+    },
+    # 4) Genéricos con restricciones: keyof e indexed access (principiante-intermedio, código roto)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": """Quiero una función `pluck(items, key)` que devuelva un array con los valores de esa propiedad, bien tipada. Lo intenté así y falla en `item[key]`:
+
+```ts
+function pluck<T>(items: T[], key: string) {
+  return items.map((item) => item[key]);
+}
+// Type 'string' cannot be used to index type 'T'.
+```""",
+            },
+            {
+                "role": "assistant",
+                "content": """El error es razonable: `T` puede ser cualquier cosa (un número, `null`...) y `key` cualquier string. Nada garantiza que `item[key]` exista. La solución es **relacionar** la clave con el tipo de los elementos mediante una restricción:
+
+```ts
+function pluck<T, K extends keyof T>(items: readonly T[], key: K): T[K][] {
+  return items.map((item) => item[key]);
+}
+```
+
+Cómo se lee:
+
+- `K extends keyof T`: `K` solo puede ser una de las claves de `T`. `extends` aquí significa «debe ser asignable a», no herencia.
+- `T[K]` es un **indexed access type**: el tipo de la propiedad `K` de `T`.
+- `readonly T[]` acepta arrays normales y de solo lectura; como no mutas la entrada, no hay motivo para exigir uno mutable.
+
+Uso:
+
+```ts
+const users = [
+  { id: 1, name: 'Ana', active: true },
+  { id: 2, name: 'Luis', active: false },
+];
+
+const names = pluck(users, 'name');   // string[]
+const flags = pluck(users, 'active'); // boolean[]
+pluck(users, 'email');
+// error: Argument of type '"email"' is not assignable to parameter of type '"id" | "name" | "active"'.
+```
+
+TypeScript infiere `K` como el literal `'name'` (no como `string`), y por eso el resultado es exactamente `string[]`.
+
+Otro uso típico de restricción: exigir una forma mínima **sin perder el resto del tipo**.
+
+```ts
+function indexById<T extends { id: string | number }>(items: readonly T[]): Map<T['id'], T> {
+  // el tipo de retorno de la flecha fuerza una tupla; sin él, TS infiere un array (T | T['id'])[]
+  return new Map(items.map((item): [T['id'], T] => [item.id, item]));
+}
+
+const byId = indexById(users); // Map<number, { id: number; name: string; active: boolean }>
+console.log(byId.get(2)?.name); // 'Luis'
+```
+
+Si hubieras tipado el parámetro como `{ id: string | number }[]`, el `Map` devolvería objetos de los que solo conoces `id`. El genérico conserva el tipo completo de lo que entra.
+
+Una regla útil para saber si necesitas un genérico: el parámetro de tipo debe aparecer **al menos dos veces**, para relacionar una entrada con otra entrada o con la salida. `function log<T>(value: T): void` no relaciona nada; ahí basta con `value: unknown`.
+
+Comprobación que sirve de test de tipos (`npx tsc --noEmit`):
+
+```ts
+const checkNames: string[] = pluck(users, 'name');
+const checkFlags: boolean[] = pluck(users, 'active');
+// @ts-expect-error: 'email' no es una clave de los usuarios
+pluck(users, 'email');
+```
+
+`@ts-expect-error` falla la compilación si la línea de debajo **deja** de dar error. Es la forma más barata de fijar que una API rechaza lo que debe rechazar.""",
+            },
+        ]
+    },
+    # 5) Utility types para derivar DTOs sin duplicar (intermedio, SISTEMA)
+    {
+        "messages": [
+            {"role": "system", "content": SISTEMA},
+            {
+                "role": "user",
+                "content": """Tengo un tipo `User` del dominio y estoy duplicando a mano los tipos para crear, actualizar y responder en la API. ¿Cómo los derivo sin repetir?
+
+```ts
+interface User {
+  id: string;
+  email: string;
+  name: string;
+  passwordHash: string;
+  createdAt: Date;
+  role: 'admin' | 'member';
+}
+```""",
+            },
+            {
+                "role": "assistant",
+                "content": """Con los *utility types* de la librería estándar. La idea es que `User` sea la única fuente de verdad y los demás tipos se calculen a partir de él:
+
+```ts
+// Crear: sin los campos que genera el servidor; la contraseña llega en claro
+type CreateUserInput = Omit<User, 'id' | 'createdAt' | 'passwordHash'> & { password: string };
+
+// Actualizar: solo los campos editables, y todos opcionales
+type UpdateUserInput = Partial<Pick<User, 'email' | 'name' | 'role'>>;
+
+// Respuesta pública: lista explícita de lo que se expone; la fecha viaja como string en JSON
+type UserResponse = Pick<User, 'id' | 'email' | 'name' | 'role'> & { createdAt: string };
+
+// Índice por id
+type UsersById = Record<User['id'], UserResponse>;
+```
+
+Fíjate en una decisión deliberada: `CreateUserInput` usa `Omit` (lista de exclusión) y `UserResponse` usa `Pick` (lista de inclusión). Si mañana alguien añade `apiKey: string` a `User`:
+
+- Con `Omit`, la respuesta pública lo incluiría automáticamente. Una fuga.
+- Con `Pick`, la respuesta no cambia hasta que alguien decida exponerlo.
+
+Para lo que sale hacia fuera, la lista de inclusión es la opción segura.
+
+Los utility types que más vas a usar:
+
+| Tipo | Qué hace |
+|---|---|
+| `Partial<T>` / `Required<T>` | todas las propiedades opcionales / obligatorias (solo el primer nivel) |
+| `Readonly<T>` | todas de solo lectura (solo el primer nivel) |
+| `Pick<T, K>` / `Omit<T, K>` | quedarse con unas claves / quitar unas claves |
+| `Record<K, V>` | objeto con claves `K` y valores `V` |
+| `Exclude<U, X>` / `Extract<U, X>` | quitar / quedarse con miembros de una unión |
+| `NonNullable<T>` | quitar `null` y `undefined` |
+| `ReturnType<F>` / `Parameters<F>` | tipo de retorno / tupla de parámetros de una función |
+| `Awaited<T>` | desenvolver promesas, también anidadas |
+
+`ReturnType` con `Awaited` evita declarar a mano el tipo de lo que devuelve una función asíncrona:
+
+```ts
+async function fetchStats() {
+  return { total: 10, byRole: { admin: 1, member: 9 } };
+}
+
+type Stats = Awaited<ReturnType<typeof fetchStats>>;
+// { total: number; byRole: { admin: number; member: number } }
+```
+
+Una trampa: `Omit` **no comprueba** que las claves existan. `Omit<User, 'passwrd'>` compila y no quita nada. Si quieres que una errata sea error:
+
+```ts
+type StrictOmit<T, K extends keyof T> = Omit<T, K>;
+type Broken = StrictOmit<User, 'passwrd'>; // error: Type '"passwrd"' does not satisfy the constraint 'keyof User'.
+```
+
+Y la pieza que cierra el círculo, el mapeo explícito:
+
+```ts
+function toUserResponse(user: User): UserResponse {
+  return {
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    role: user.role,
+    createdAt: user.createdAt.toISOString(),
+  };
+}
+```
+
+Comprobación: añade `phone: string` a `User` y a la lista del `Pick`. `toUserResponse` dejará de compilar (`Property 'phone' is missing...`) hasta que la actualices. El compilador te obliga a decidir campo a campo qué sale de la API.""",
+            },
+        ]
+    },
+    # 6) infer y tipos condicionales distributivos (inglés, avanzado)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Can you explain `infer` with practical examples? I get the syntax but not when I'd actually use it. Also, why does my `ToArray<string | number>` give `string[] | number[]` instead of `(string | number)[]`?",
+            },
+            {
+                "role": "assistant",
+                "content": """A conditional type `T extends U ? X : Y` is pattern matching on types. `infer` declares a type variable **inside the pattern** to capture the piece you care about, the same way a regex capture group grabs part of a string.
+
+Four uses you'll actually meet:
+
+```ts
+// 1. Element type of an array (including readonly arrays)
+type ElementOf<T> = T extends readonly (infer E)[] ? E : never;
+type A = ElementOf<string[]>; // string
+
+// 2. Unwrap promises, recursively (a simplified Awaited)
+type Unwrap<T> = T extends PromiseLike<infer V> ? Unwrap<V> : T;
+type B = Unwrap<Promise<Promise<number>>>; // number
+
+// 3. First parameter of a function
+type FirstArg<F> = F extends (first: infer P, ...rest: any[]) => unknown ? P : never;
+type C = FirstArg<(id: string, retries: number) => void>; // string
+
+// 4. A real one: payload types derived from a handler map, written once
+type Handlers = {
+  userCreated: (payload: { id: string }) => void;
+  orderPaid: (payload: { orderId: string; amount: number }) => void;
+};
+type PayloadOf<K extends keyof Handlers> = FirstArg<Handlers[K]>;
+type D = PayloadOf<'orderPaid'>; // { orderId: string; amount: number }
+```
+
+Why `any[]` for the rest parameters in `FirstArg` and not `unknown[]`: function parameters are checked contravariantly. For `(id: string, retries: number) => void` to match `(first: P, ...rest: unknown[]) => unknown`, an `unknown` would have to be assignable to `number`, which it isn't, so the match fails and you get `never`. The built-in `Parameters<T>` uses `any` for the same reason.
+
+**Now your `ToArray` question.** Conditional types **distribute over unions** when the checked type is a naked type parameter. TypeScript applies the condition to each member separately and unions the results:
+
+```ts
+type ToArray<T> = T extends unknown ? T[] : never;
+type E = ToArray<string | number>;
+// = ToArray<string> | ToArray<number> = string[] | number[]
+```
+
+Distribution is a feature: it's how `Exclude<T, U> = T extends U ? never : T` filters a union member by member. To turn it off, wrap both sides in a one-element tuple so `T` is no longer naked:
+
+```ts
+type ToArrayNonDist<T> = [T] extends [unknown] ? T[] : never;
+type F = ToArrayNonDist<string | number>; // (string | number)[]
+```
+
+One trap that follows from distribution: `never` is the empty union, so a distributive conditional over `never` yields `never` without evaluating either branch. That's why a naive `IsNever<T> = T extends never ? true : false` returns `never` instead of `true`, and the correct version uses the tuple wrapper: `[T] extends [never] ? true : false`.
+
+To verify all of this, encode the expectations as type-level tests that make `tsc --noEmit` fail if any of them breaks:
+
+```ts
+type Expect<T extends true> = T;
+type Equal<X, Y> =
+  (<G>() => G extends X ? 1 : 2) extends (<G>() => G extends Y ? 1 : 2) ? true : false;
+
+type Tests = [
+  Expect<Equal<ElementOf<readonly string[]>, string>>,
+  Expect<Equal<Unwrap<Promise<Promise<number>>>, number>>,
+  Expect<Equal<PayloadOf<'userCreated'>, { id: string }>>,
+  Expect<Equal<ToArray<string | number>, string[] | number[]>>,
+  Expect<Equal<ToArrayNonDist<string | number>, (string | number)[]>>,
+];
+```
+
+`Equal` uses that odd generic-function form because a plain mutual `extends` check treats `any` as equal to everything. If you already use Vitest, `expectTypeOf(...).toEqualTypeOf<...>()` gives you the same checks with better error messages.""",
+            },
+        ]
+    },
+    # 7) Template literal types: parámetros de ruta tipados (avanzado)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Quiero que `buildUrl('/users/:userId/posts/:postId', { userId: '1', postId: '2' })` me obligue a pasar exactamente los parámetros de la ruta: ni uno de menos ni uno de más. ¿Se puede con template literal types?",
+            },
+            {
+                "role": "assistant",
+                "content": """Sí. Un template literal type puede usarse como patrón con `infer`, y aplicado de forma recursiva extrae cada `:param` del string.
+
+```ts
+type ExtractParams<Path extends string> =
+  Path extends `${string}:${infer Param}/${infer Rest}`
+    ? Param | ExtractParams<`/${Rest}`>
+    : Path extends `${string}:${infer Param}`
+      ? Param
+      : never;
+
+type P = ExtractParams<'/users/:userId/posts/:postId'>; // 'userId' | 'postId'
+```
+
+Traza del cálculo:
+
+1. `'/users/:userId/posts/:postId'` encaja en el primer patrón: lo anterior al primer `:` va a `${string}`, `Param` captura hasta la siguiente `/` (`'userId'`) y `Rest` es `'posts/:postId'`.
+2. Recursión con `'/posts/:postId'`: el primer patrón ya no encaja (no hay `/` después del parámetro), pero el segundo sí: `Param = 'postId'`.
+3. Sin más `:`, la recursión acaba en `never`, que desaparece de la unión.
+
+Con eso, el tipo de los parámetros y la función:
+
+```ts
+type RouteParams<Path extends string> = { [K in ExtractParams<Path>]: string | number };
+
+export function buildUrl<Path extends string>(path: Path, params: RouteParams<Path>): string {
+  const values = params as Record<string, string | number | undefined>;
+  return path.replace(/:([^/]+)/g, (_match, name: string) => {
+    const value = values[name];
+    if (value === undefined) throw new Error(`falta el parámetro ${name} para ${path}`);
+    return encodeURIComponent(String(value));
+  });
+}
+```
+
+El `as` es necesario porque TypeScript no sabe indexar un tipo mapeado genérico con un `string` cualquiera. Lo compensa la comprobación en ejecución, y la regex usa la misma definición de parámetro que el tipo (todo hasta la siguiente `/`) para que ambos no puedan divergir.
+
+Lo que garantiza:
+
+```ts
+buildUrl('/users/:userId/posts/:postId', { userId: 1, postId: 'a b' }); // '/users/1/posts/a%20b'
+
+buildUrl('/users/:userId', {});
+// error: Property 'userId' is missing in type '{}' but required in type 'RouteParams<"/users/:userId">'.
+
+buildUrl('/users/:userId', { userId: 1, extra: 2 });
+// error: Object literal may only specify known properties, and 'extra' does not exist...
+```
+
+Dos límites que conviene conocer:
+
+- **El path debe ser un literal.** Si llega como `string` (por ejemplo, leído de una configuración), `ExtractParams<string>` da `never`, `params` pasa a ser `{}` y se pierde toda la seguridad sin aviso. Declara las rutas en un objeto `as const`.
+- **Cuidado con las combinaciones.** `` `${A}-${B}` `` con uniones grandes genera el producto cartesiano. Con unos cientos de miembros por lado, TypeScript se rinde con `Expression produces a union type that is too complex to represent`.
+
+Tests de tipos y de ejecución en el mismo archivo:
+
+```ts
+import assert from 'node:assert/strict';
+
+const params: RouteParams<'/a/:x/b/:y'> = { x: 1, y: 2 };
+// @ts-expect-error: falta y
+const missing: RouteParams<'/a/:x/b/:y'> = { x: 1 };
+
+assert.equal(buildUrl('/a/:x/b/:y', params), '/a/1/b/2');
+assert.equal(buildUrl('/health', {}), '/health');
+```""",
+            },
+        ]
+    },
+    # 8) satisfies frente a anotación y as (intermedio)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "¿Para qué sirve `satisfies`? Ya tengo `const routes: Routes = {...}` y funciona igual, ¿no?",
+            },
+            {
+                "role": "assistant",
+                "content": """No exactamente. La anotación **valida y además reemplaza** el tipo inferido por el declarado; `satisfies` **valida y conserva** el inferido. La diferencia aparece en cuanto usas el valor.
+
+```ts
+type Route = { path: string; auth: boolean };
+type Routes = Record<string, Route>;
+
+const annotated: Routes = {
+  home: { path: '/', auth: false },
+  admin: { path: '/admin', auth: true },
+};
+annotated.admni; // compila: el tipo es Record<string, Route> y cualquier clave vale
+
+const routes = {
+  home: { path: '/', auth: false },
+  admin: { path: '/admin', auth: true },
+} satisfies Routes;
+routes.admni; // error: Property 'admni' does not exist on type '{ home: ...; admin: ...; }'
+
+type RouteName = keyof typeof routes; // 'home' | 'admin'
+```
+
+Con la anotación, TypeScript «olvida» qué claves escribiste: la errata `admni` pasa y `keyof` te da `string`. Con `satisfies` tienes las dos cosas: el objeto se comprueba contra `Routes` (una propiedad mal escrita o un `auth` que falte son error) y el tipo resultante es el preciso.
+
+Las tres formas, comparadas:
+
+| | ¿Valida contra `T`? | Tipo resultante |
+|---|---|---|
+| `const x: T = valor` | sí | `T` (se pierde el detalle) |
+| `const x = valor satisfies T` | sí | el inferido, más preciso |
+| `const x = valor as T` | apenas (solo exige que los tipos se solapen) | `T` |
+
+`as` es la única que puede mentir: `{} as Route` compila. Resérvalo para cuando tú sabes algo que el compilador no puede saber.
+
+Combinado con `as const` (TS 5.0+) conservas también los literales y el `readonly`:
+
+```ts
+const statusColors = {
+  active: '#16a34a',
+  paused: '#ca8a04',
+  failed: '#dc2626',
+} as const satisfies Record<string, `#${string}`>;
+
+type Status = keyof typeof statusColors;       // 'active' | 'paused' | 'failed'
+const color = statusColors.failed;             // '#dc2626', no string
+```
+
+El tipo del `satisfies` exige que cada valor sea un string que empiece por `#` (un color sin él es error), y `as const` mantiene cada valor como literal.
+
+Cuándo usar cada una:
+
+- **Anotación** cuando el tipo declarado **es** el contrato: una variable que vas a reasignar, el tipo de retorno de una función exportada.
+- **`satisfies`** para objetos de configuración, tablas de búsqueda y mapas de rutas, donde quieres validar la forma y seguir usando las claves y valores concretos.
+
+Comprobación: con el ejemplo de rutas, `npx tsc --noEmit` debe marcar `routes.admni` y no `annotated.admni`. Esa línea que pasa sin error es exactamente el bug que `satisfies` evita.""",
+            },
+        ]
+    },
+    # 9) enum frente a uniones de literales y as const; const enum y type stripping (intermedio, multiturno)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "En el equipo usamos `enum` para todo (estados, roles...). Un compañero dice que es mejor usar uniones de strings. ¿Quién tiene razón?",
+            },
+            {
+                "role": "assistant",
+                "content": """Para código nuevo, tu compañero. Los `enum` funcionan, pero tienen costes que las uniones de literales no tienen:
+
+1. **Generan código.** Un `enum` es de las pocas construcciones de TypeScript que producen un objeto en ejecución (y, en los numéricos, además un mapeo inverso). Las uniones desaparecen al compilar.
+2. **Los enums de strings son nominales.** No puedes pasar el literal donde se espera el enum, lo que choca con datos que llegan como JSON:
+
+```ts
+enum Status { Active = 'active', Paused = 'paused' }
+function setStatus(status: Status) {}
+setStatus('active'); // error: Argument of type '"active"' is not assignable to parameter of type 'Status'.
+```
+
+3. **Los enums numéricos son laxos**: un `number` cualquiera sigue siendo asignable a ellos, así que la comprobación es más débil de lo que parece.
+4. **Las herramientas que solo quitan tipos no los soportan**, como el modo de Node que ejecuta `.ts` directamente.
+
+La alternativa idiomática da lo mismo que un enum (nombres con autocompletado y valores en ejecución) sin esos costes:
+
+```ts
+export const OrderStatus = {
+  Pending: 'pending',
+  Paid: 'paid',
+  Shipped: 'shipped',
+} as const;
+
+export type OrderStatus = (typeof OrderStatus)[keyof typeof OrderStatus];
+// 'pending' | 'paid' | 'shipped'
+
+function canCancel(status: OrderStatus): boolean {
+  return status === OrderStatus.Pending;
+}
+
+canCancel('paid');           // vale: el literal es del tipo
+canCancel(OrderStatus.Paid); // también
+const allStatuses = Object.values(OrderStatus); // para un <select>
+```
+
+Usar el mismo nombre para el valor y el tipo es legal (viven en espacios distintos) y se lee como un enum.
+
+Y para validar datos de fuera:
+
+```ts
+const ORDER_STATUSES: ReadonlySet<string> = new Set(Object.values(OrderStatus));
+
+export function isOrderStatus(value: string): value is OrderStatus {
+  return ORDER_STATUSES.has(value);
+}
+```
+
+No hace falta migrar todo de golpe: los enums existentes no son un bug. Basta con acordar que lo nuevo se escribe así y convertir los viejos cuando se toquen.""",
+            },
+            {
+                "role": "user",
+                "content": "¿Y `const enum`? Leí que no genera código. Y eso de Node ejecutando .ts, ¿qué tiene que ver?",
+            },
+            {
+                "role": "assistant",
+                "content": """Las dos preguntas tienen la misma raíz: **qué herramientas pueden compilar un archivo mirándolo solo a él**.
+
+**`const enum`** no genera objeto porque `tsc` sustituye cada uso por su valor (`OrderStatus.Paid` → `'paid'`). Para hacerlo necesita ver la declaración del enum, que puede estar en otro archivo. Eso es posible para `tsc`, que analiza el programa entero, pero no para los transpiladores que procesan cada archivo por separado: esbuild, swc, Babel y el modo de Node que quita tipos. Por eso:
+
+- Con `isolatedModules: true` (lo que exigen esas herramientas), usar un `const enum` declarado en un `.d.ts` de una librería es un error.
+- El propio manual de TypeScript tiene una sección de «const enum pitfalls» y desaconseja exponerlos en APIs públicas.
+
+**Node y los `.ts`**: Node 22.6 añadió `--experimental-strip-types`, y versiones posteriores lo activan por defecto. Ejecuta TypeScript **borrando** las anotaciones, sin transformar nada. Eso funciona con cualquier sintaxis que sea «JavaScript más tipos», pero no con las construcciones que generan código:
+
+| Construcción | ¿Se puede borrar sin más? |
+|---|---|
+| anotaciones, `interface`, `type`, `as`, `satisfies` | sí |
+| `enum` | no: genera un objeto |
+| `namespace` con código | no |
+| propiedades de parámetro (`constructor(private db: Db)`) | no: generan asignaciones |
+
+Para esas, Node pide `--experimental-transform-types`.
+
+TypeScript 5.8 añadió la opción **`erasableSyntaxOnly`**, que marca como error en tu editor todo lo que no se puede borrar sin más, `enum` incluido:
+
+```json
+{
+  "compilerOptions": {
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true
+  }
+}
+```
+
+Si activan esas dos opciones, el código será compatible con Node ejecutando `.ts` directamente y con cualquier transpilador que vaya archivo por archivo. Y el patrón `as const` de antes las cumple sin cambios: es JavaScript normal con un tipo derivado.
+
+Comprobación: activa `erasableSyntaxOnly` y ejecuta `npx tsc --noEmit`. La lista de errores es exactamente el inventario de enums, namespaces y propiedades de parámetro que tendrían que migrar.""",
+            },
+        ]
+    },
+    # 10) Qué activa strict y noUncheckedIndexedAccess (intermedio, system: conciso)
+    {
+        "messages": [
+            {"role": "system", "content": "Sé conciso y directo. Prioriza tablas y ejemplos mínimos."},
+            {
+                "role": "user",
+                "content": "¿Qué activa exactamente `strict: true` en el tsconfig y qué flags que no están incluidas valen la pena? Acabo de activar `noUncheckedIndexedAccess` y me salieron 200 errores. ¿La quito?",
+            },
+            {
+                "role": "assistant",
+                "content": """No la quites: esos 200 errores son accesos que pueden dar `undefined` en ejecución.
+
+**Lo que activa `strict: true`** (TS 5.x):
+
+| Flag | Qué exige |
+|---|---|
+| `noImplicitAny` | nada de `any` inferido en silencio |
+| `strictNullChecks` | `null` y `undefined` no caben en cualquier tipo |
+| `strictFunctionTypes` | parámetros de funciones comprobados de forma contravariante |
+| `strictBindCallApply` | `bind`, `call` y `apply` tipados |
+| `strictPropertyInitialization` | las propiedades de clase se inicializan en el constructor |
+| `noImplicitThis` | `this` con tipo conocido |
+| `useUnknownInCatchVariables` | `catch (e)` es `unknown`, no `any` |
+| `alwaysStrict` | emite `"use strict"` |
+| `strictBuiltinIteratorReturn` (5.6+) | los iteradores nativos devuelven `undefined`, no `any`, al terminar |
+
+**Fuera de `strict`, pero recomendables:**
+
+| Flag | Qué atrapa |
+|---|---|
+| `noUncheckedIndexedAccess` | `arr[i]` y `obj[clave]` pueden ser `undefined` |
+| `exactOptionalPropertyTypes` | distingue «propiedad ausente» de «presente con `undefined`» |
+| `noImplicitOverride` | exige `override` al redefinir métodos de la clase padre |
+| `noFallthroughCasesInSwitch` | `case` que caen al siguiente sin `break` |
+
+**Cómo se arreglan esos errores.** Casi todos responden a pocos patrones:
+
+```ts
+const items: string[] = loadItems();
+
+const first = items[0];                         // string | undefined
+if (first === undefined) throw new Error('lista vacía');
+first.toUpperCase();                            // string
+
+for (const item of items) item.toUpperCase();   // for...of no se ve afectado
+items.map((item) => item.trim());               // los métodos tampoco
+
+const labels: Record<string, string> = {};
+const label = labels['es'] ?? 'Sin etiqueta';   // valor por defecto explícito
+```
+
+Los bucles `for (let i = 0; i < items.length; i++)` con `items[i]` dentro son la fuente más común: pásalos a `for...of` o `entries()` y el error desaparece sin aserciones.
+
+**Dónde están concentrados:**
+
+```bash
+npx tsc --noEmit --pretty false | grep 'error TS' | cut -d'(' -f1 | sort | uniq -c | sort -rn | head
+```
+
+Empieza por los archivos con más errores. Evita sustituir cada uno por `!`: eso es apagar la flag línea a línea.""",
+            },
+        ]
+    },
+    # 11) Declaraciones .d.ts para una librería sin tipos y aumento de globales (intermedio, código roto, México)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": """Uso una librería vieja en JS sin tipos (`legacy-pdf`) y TS me marca:
+
+```
+error TS7016: Could not find a declaration file for module 'legacy-pdf'. '/app/node_modules/legacy-pdf/index.js' implicitly has an 'any' type.
+  Try `npm i --save-dev @types/legacy-pdf` if it exists or add a new declaration (.d.ts) file containing `declare module 'legacy-pdf';`
+```
+
+No existe `@types/legacy-pdf`. Ahorita lo resolví con `declare module 'legacy-pdf';` pero todo queda en `any`. ¿Cómo lo tipo bien?""",
+            },
+            {
+                "role": "assistant",
+                "content": """`declare module 'legacy-pdf';` a secas le dice al compilador «existe, y todo lo que exporta es `any`». Quita el error, pero también todo el chequeo. Lo correcto es escribir un archivo de declaraciones que describa **solo la parte de la librería que usas**.
+
+**Paso 1: mira qué exporta de verdad.** El `.d.ts` tiene que describir la forma real del módulo, no la que imaginas:
+
+```bash
+node -e "const m = require('legacy-pdf'); console.log(typeof m, Object.keys(m))"
+```
+
+Supongamos que imprime `object [ 'createDocument' ]`.
+
+**Paso 2: el archivo de declaraciones.**
+
+```ts
+// types/legacy-pdf.d.ts
+declare module 'legacy-pdf' {
+  export interface PdfOptions {
+    pageSize?: 'A4' | 'Letter';
+    margins?: { top: number; right: number; bottom: number; left: number };
+  }
+
+  export interface PdfDocument {
+    addText(text: string, options?: { x?: number; y?: number; fontSize?: number }): PdfDocument;
+    addPage(): PdfDocument;
+    toBuffer(): Promise<Buffer>;
+  }
+
+  export function createDocument(options?: PdfOptions): PdfDocument;
+}
+```
+
+Si en cambio el módulo exporta directamente una función (`module.exports = createDocument`), la declaración cambia a `export = createDocument;` dentro del bloque, y lo importas con `esModuleInterop` activado.
+
+**Paso 3: que el compilador lo vea.** Basta con que la carpeta esté en `include`:
+
+```json
+{ "include": ["src", "types"] }
+```
+
+Tres trampas habituales:
+
+1. **Nada de `import` ni `export` en el nivel superior de ese archivo.** Si los añades, el archivo pasa a ser un módulo y `declare module 'legacy-pdf'` deja de ser una declaración para convertirse en un *aumento* de un módulo que no existe. Si necesitas tipos de otro paquete, impórtalos **dentro** del bloque `declare module`.
+2. **`Buffer` necesita `@types/node`.** Sin él, ese tipo no existe.
+3. **`skipLibCheck: true` también se salta tus `.d.ts`.** Un error dentro de este archivo no se reportará. Compruébalo de vez en cuando con `npx tsc --noEmit --skipLibCheck false`.
+
+**El caso contrario: aumentar algo global.** Tipar `process.env` es el ejemplo típico:
+
+```ts
+// types/env.d.ts
+declare global {
+  namespace NodeJS {
+    interface ProcessEnv {
+      DATABASE_URL: string;
+      LOG_LEVEL?: 'debug' | 'info' | 'warn' | 'error';
+    }
+  }
+}
+
+export {};
+```
+
+Aquí el `export {}` es **obligatorio**, al revés que antes: `declare global` solo se permite dentro de un módulo. Y recuerda que esto solo **declara**: si `DATABASE_URL` falta en el entorno, el tipo dirá `string` y el valor será `undefined`. Valida las variables al arrancar.
+
+**Comprobación**: un archivo de prueba que use la API y fije lo que debe rechazar.
+
+```ts
+import { createDocument } from 'legacy-pdf';
+
+const doc = createDocument({ pageSize: 'A4' }).addText('Factura 0042', { fontSize: 14 });
+const pdf: Promise<Buffer> = doc.toBuffer();
+
+// @ts-expect-error: tamaño de página no soportado
+createDocument({ pageSize: 'A3' });
+```
+
+Si `npx tsc --noEmit` pasa, las declaraciones están conectadas. Si TS7016 vuelve a salir, la carpeta `types` no está en `include`.""",
+            },
+        ]
+    },
+    # 12) Validar JSON externo con zod; transformaciones y tipos de entrada/salida (intermedio, SISTEMA, multiturno)
+    {
+        "messages": [
+            {"role": "system", "content": SISTEMA},
+            {
+                "role": "user",
+                "content": """Tengo esto y compila sin quejarse:
+
+```ts
+async function getUser(id: string): Promise<User> {
+  const res = await fetch(`https://api.example.com/users/${id}`);
+  return res.json();
+}
+```
+
+Pero el otro día la API cambió `name` por `fullName` y reventó en producción con `Cannot read properties of undefined`. ¿TypeScript no debería haberlo detectado?""",
+            },
+            {
+                "role": "assistant",
+                "content": """No podía: `res.json()` devuelve `Promise<any>`, y `any` es asignable a cualquier tipo. Tu `Promise<User>` es, en la práctica, un `as User` disfrazado. TypeScript comprueba **tu código**, no los datos que llegan en ejecución. Para eso hace falta validar en la frontera.
+
+Con zod, el esquema valida en ejecución y además **genera** el tipo, así que no pueden divergir:
+
+```ts
+import { z } from 'zod';
+
+const UserSchema = z.object({
+  id: z.string(),
+  name: z.string().min(1),
+  email: z.string().email(),
+  role: z.enum(['admin', 'member']),
+});
+
+export type User = z.infer<typeof UserSchema>;
+
+export async function getUser(id: string): Promise<User> {
+  const res = await fetch(`https://api.example.com/users/${encodeURIComponent(id)}`);
+  if (!res.ok) throw new Error(`GET /users/${id} -> HTTP ${res.status}`);
+
+  const body: unknown = await res.json();
+  const result = UserSchema.safeParse(body);
+  if (!result.success) {
+    const problems = result.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`);
+    throw new Error(`respuesta inesperada de /users/${id}: ${problems.join('; ')}`);
+  }
+  return result.data;
+}
+```
+
+Qué cambia con el incidente que tuviste: en lugar de un `TypeError` en cualquier punto de la app, el día que la API renombre el campo obtienes `respuesta inesperada de /users/7: name: Required` (el texto exacto depende de la versión de zod) **en la llamada**, con el campo culpable. Eso se diagnostica en un minuto.
+
+Detalles de diseño:
+
+- **`const body: unknown`** es un hábito que conviene tener: obliga a validar antes de usar. Con `typescript-eslint`, las reglas `no-unsafe-assignment` y `no-unsafe-return` señalan los `any` que se escapan así.
+- **zod descarta las claves desconocidas** de los objetos por defecto. Si la API añade campos, no se cuelan en tu dominio.
+- **El coste** de validar es despreciable frente al de la llamada de red.
+- Este código vale para zod 3 y zod 4. En zod 4 también existe la forma corta `z.email()`.
+
+Prueba con el cambio que te rompió producción:
+
+```ts
+import assert from 'node:assert/strict';
+
+const renamed = UserSchema.safeParse({ id: '1', fullName: 'Ana', email: 'ana@example.com', role: 'admin' });
+assert.equal(renamed.success, false);
+assert.deepEqual(renamed.error?.issues.map((issue) => issue.path.join('.')), ['name']);
+```""",
+            },
+            {
+                "role": "user",
+                "content": "Ok. Pero las fechas vienen como string ISO (`createdAt`) y otro servicio me manda los ids numéricos como string. ¿Cómo convierto al validar?",
+            },
+            {
+                "role": "assistant",
+                "content": r"""Con `.transform()`: primero validas el formato del string y después lo conviertes. Así el esquema describe las dos caras del dato, lo que llega por la red y lo que usa tu código.
+
+```ts
+import { z } from 'zod';
+
+const OrderSchema = z.object({
+  id: z.string().regex(/^\d+$/, 'el id debe ser numérico').transform(Number),
+  createdAt: z.string().datetime({ offset: true }).transform((value) => new Date(value)),
+  totalCents: z.number().int().nonnegative(),
+});
+
+type OrderInput = z.input<typeof OrderSchema>;   // { id: string; createdAt: string; totalCents: number }
+type Order = z.output<typeof OrderSchema>;       // { id: number; createdAt: Date; totalCents: number }
+```
+
+Con transformaciones, `z.infer` es el tipo de **salida**. `z.input` te da el de entrada, útil para tipar fixtures de tests o el cuerpo crudo que guardas en una caché.
+
+Por qué no uso `z.coerce` aquí, aunque sea más corto:
+
+- `z.coerce.date()` aplica `new Date(valor)` a lo que llegue, y `new Date(null)` es el 1 de enero de 1970: un `createdAt: null` pasaría como fecha válida.
+- `z.coerce.number()` aplica `Number(valor)`, y `Number('')` es `0`: un id vacío se convertiría en el pedido 0.
+
+La coerción está bien para entradas controladas, como un query string con un número de página. Para datos de otro servicio, valida el formato de forma explícita y convierte después.
+
+`{ offset: true }` acepta fechas con zona (`-05:00`), no solo las terminadas en `Z`. En zod 4 la forma recomendada es `z.iso.datetime({ offset: true })`; la de arriba sigue funcionando.
+
+Para los mensajes de error, una función que vale en las dos versiones:
+
+```ts
+export function describeIssues(error: z.ZodError): string {
+  return error.issues
+    .map((issue) => `${issue.path.join('.') || '(raíz)'}: ${issue.message}`)
+    .join('; ');
+}
+```
+
+Prueba de ida (válido) y de vuelta (inválido):
+
+```ts
+import assert from 'node:assert/strict';
+
+const order = OrderSchema.parse({ id: '42', createdAt: '2024-05-01T12:00:00-05:00', totalCents: 1999 });
+assert.equal(order.id, 42);
+assert.ok(order.createdAt instanceof Date);
+assert.equal(order.createdAt.toISOString(), '2024-05-01T17:00:00.000Z');
+
+const bad = OrderSchema.safeParse({ id: '', createdAt: null, totalCents: 10 });
+assert.equal(bad.success, false);
+assert.deepEqual(bad.error?.issues.map((issue) => issue.path[0]), ['id', 'createdAt']);
+```""",
+            },
+        ]
+    },
+    # 13) Valibot como alternativa ligera a zod (inglés, intermedio)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "We're building an embeddable frontend widget and zod adds noticeable bundle weight. Is valibot a real alternative? Show me a user schema in valibot v1 and what changes in practice.",
+            },
+            {
+                "role": "assistant",
+                "content": """Yes, it's a solid alternative, and the reason it's smaller is architectural. Classic zod is a chained, class-based API: once you import `z`, the methods come along whether you use them or not. Valibot v1 is a set of independent functions composed with `pipe`, so the bundler keeps only the validators you actually call.
+
+The same schema in valibot v1:
+
+```ts
+import * as v from 'valibot';
+
+const UserSchema = v.object({
+  id: v.string(),
+  name: v.pipe(v.string(), v.minLength(1)),
+  email: v.pipe(v.string(), v.email()),
+  role: v.picklist(['admin', 'member']),
+  createdAt: v.pipe(
+    v.string(),
+    v.isoTimestamp(),
+    v.transform((value) => new Date(value)),
+  ),
+});
+
+type UserInput = v.InferInput<typeof UserSchema>;   // createdAt: string
+type User = v.InferOutput<typeof UserSchema>;       // createdAt: Date
+
+export function parseUser(data: unknown): User {
+  const result = v.safeParse(UserSchema, data);
+  if (!result.success) {
+    const problems = result.issues.map((issue) => {
+      const path = issue.path?.map((item) => item.key).join('.') ?? '(root)';
+      return `${path}: ${issue.message}`;
+    });
+    throw new Error(`invalid user payload: ${problems.join('; ')}`);
+  }
+  return result.output;
+}
+```
+
+What changes in practice, side by side:
+
+| | zod (classic API) | valibot v1 |
+|---|---|---|
+| Style | `z.string().min(1).email()` | `v.pipe(v.string(), v.minLength(1), v.email())` |
+| Parse | `Schema.safeParse(data)` | `v.safeParse(Schema, data)` |
+| Result | `result.data` / `result.error.issues` | `result.output` / `result.issues` |
+| Types | `z.infer`, `z.input` | `v.InferOutput`, `v.InferInput` |
+| Bundle | larger baseline | grows with what you use |
+
+Three things worth knowing before you switch:
+
+1. **Measure; don't assume.** The win depends on how many validators you use. Bundle both versions of your real schemas and compare: `npx esbuild src/widget.ts --bundle --minify --metafile=meta.json`, then inspect `meta.json` (or paste it into esbuild's online analyzer).
+2. **zod 4 narrowed the gap.** It ships `zod/mini`, a functional, tree-shakable variant of the API. If the rest of your codebase already speaks zod, try that before migrating.
+3. **The ecosystem mostly supports both.** Both libraries implement the Standard Schema interface, so form and RPC libraries that accept a "standard schema" work with either. `@hookform/resolvers`, for example, has resolvers for both.
+
+A minimal check of the behavior you rely on:
+
+```ts
+import assert from 'node:assert/strict';
+
+const user = parseUser({
+  id: 'u1',
+  name: 'Ana',
+  email: 'ana@example.com',
+  role: 'admin',
+  createdAt: '2024-05-01T12:00:00Z',
+});
+assert.ok(user.createdAt instanceof Date);
+
+assert.throws(
+  () => parseUser({ id: 'u1', name: '', email: 'nope', role: 'owner', createdAt: 'yesterday' }),
+  /invalid user payload/,
+);
+```
+
+Like zod's default object schema, `v.object` drops unknown keys from the output, so the widget never carries fields you didn't declare.""",
+            },
+        ]
+    },
+    # 14) catch (e) es unknown: cómo estrechar el error (principiante, código roto)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": """Actualicé TypeScript y activé strict, y ahora todos mis catch dan error:
+
+```ts
+try {
+  await saveOrder(order);
+} catch (e) {
+  console.error(e.message); // 'e' is of type 'unknown'.
+}
+```
+
+¿Cómo lo arreglo? ¿Le pongo `catch (e: any)`?""",
+            },
+            {
+                "role": "assistant",
+                "content": """No: `any` solo apaga el aviso. El error tiene un motivo de fondo: **en JavaScript se puede lanzar cualquier cosa**, no solo objetos `Error`.
+
+```ts
+throw 'falló';            // un string
+throw 404;                // un número
+throw { code: 'E_AUTH' }; // un objeto cualquiera
+throw null;               // incluso esto
+```
+
+Por eso, con `strict` (que incluye `useUnknownInCatchVariables` desde TS 4.4), la variable del `catch` es `unknown`. TypeScript te obliga a comprobar qué es antes de usarla, igual que harías con un dato que llega de fuera.
+
+La forma directa es estrechar con `instanceof`:
+
+```ts
+try {
+  await saveOrder(order);
+} catch (error) {
+  if (error instanceof Error) {
+    console.error(error.message); // aquí error es Error
+  } else {
+    console.error('se lanzó algo que no es un Error:', error);
+  }
+}
+```
+
+Como esto se repite mucho, conviene una función pequeña:
+
+```ts
+export function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  try {
+    return JSON.stringify(error) ?? String(error);
+  } catch {
+    return String(error); // por ejemplo, un objeto con referencias circulares
+  }
+}
+```
+
+El `?? String(error)` cubre `undefined`, para el que `JSON.stringify` devuelve `undefined` en vez de un string.
+
+Dos cosas que no funcionan:
+
+- `catch (e: Error)` no se permite: `Catch clause variable type annotation must be 'any' or 'unknown' if specified.` TypeScript no puede garantizar qué se lanzó.
+- Asumir que todo error tiene `.message`. Una librería que hace `throw 'timeout'` te dejaría con `undefined` en el log.
+
+Y cuando quieras reaccionar distinto según el fallo, usa clases propias y deja subir lo que no sepas tratar:
+
+```ts
+class OutOfStockError extends Error {
+  readonly sku: string;
+
+  constructor(sku: string) {
+    super(`sin existencias: ${sku}`);
+    this.name = 'OutOfStockError';
+    this.sku = sku;
+  }
+}
+
+try {
+  await saveOrder(order);
+} catch (error) {
+  if (error instanceof OutOfStockError) {
+    showMessage(`El producto ${error.sku} se agotó`);
+  } else {
+    throw error; // lo inesperado no se esconde
+  }
+}
+```
+
+Prueba rápida de `errorMessage`:
+
+```ts
+import assert from 'node:assert/strict';
+
+assert.equal(errorMessage(new Error('sin conexión')), 'sin conexión');
+assert.equal(errorMessage('timeout'), 'timeout');
+assert.equal(errorMessage({ code: 'E_AUTH' }), '{"code":"E_AUTH"}');
+assert.equal(errorMessage(undefined), 'undefined');
+```""",
+            },
+        ]
+    },
+    # 15) Revisión: operador de aserción no nula (intermedio, system: revisor estricto, código roto)
+    {
+        "messages": [
+            {
+                "role": "system",
+                "content": "Eres un revisor de código estricto: señalas riesgos reales de producción, no preferencias de estilo, y propones el arreglo concreto.",
+            },
+            {
+                "role": "user",
+                "content": """Me pasaron este PR para revisar antes de que lo suban a prod, ¿lo apruebo?
+
+```ts
+function getCheckoutButton(): HTMLButtonElement {
+  return document.querySelector<HTMLButtonElement>('#checkout')!;
+}
+
+function getDiscount(code: string, discounts: Map<string, number>): number {
+  return discounts.get(code)!;
+}
+
+function primaryEmail(user: { emails: string[] }): string {
+  return user.emails.find((email) => email.endsWith('@empresa.com'))!.toLowerCase();
+}
+```""",
+            },
+            {
+                "role": "assistant",
+                "content": """No lo apruebes todavía. Los tres `!` (aserción no nula) le dicen al compilador «confía en mí, esto nunca es `null` ni `undefined`», sin ninguna comprobación en ejecución. Cuando la suposición falla, el error aparece lejos de su causa, o peor, no aparece.
+
+**1. `getDiscount`: el más grave, porque falla en silencio.** Con un código de descuento que no existe, `get` devuelve `undefined` con tipo `number`. `precio - undefined` da `NaN`, y ese `NaN` viaja hasta el total del pedido sin que nada lance un error. Decide la política de forma explícita:
+
+```ts
+function getDiscount(code: string, discounts: ReadonlyMap<string, number>): number {
+  return discounts.get(code) ?? 0; // código desconocido: sin descuento
+}
+```
+
+Si el negocio quiere avisar al usuario de que el código no es válido, lanza un error específico en vez de devolver 0. Lo que no vale es dejarlo sin decidir.
+
+**2. `primaryEmail`: `TypeError` garantizado** para cualquier usuario sin correo corporativo: `Cannot read properties of undefined (reading 'toLowerCase')`. Que el tipo de retorno diga la verdad y que decida quien llama:
+
+```ts
+function primaryEmail(user: { emails: readonly string[] }): string | undefined {
+  return user.emails.find((email) => email.endsWith('@empresa.com'))?.toLowerCase();
+}
+```
+
+**3. `getCheckoutButton`: dos suposiciones sin comprobar.** El `!` supone que el elemento existe (falla si alguien cambia el `id` o si el script corre antes de que exista el DOM). Y el genérico `<HTMLButtonElement>` es otra aserción encubierta: si `#checkout` es un `<a>`, el tipo miente. Un `instanceof` comprueba las dos cosas y falla pronto, con un mensaje que dice qué buscar:
+
+```ts
+function getCheckoutButton(): HTMLButtonElement {
+  const element = document.querySelector('#checkout');
+  if (!(element instanceof HTMLButtonElement)) {
+    throw new Error('No se encontró #checkout o no es un <button>');
+  }
+  return element;
+}
+```
+
+Para los casos en que sí quieres fallar si falta algo, una función de aserción sustituye al `!` con una comprobación real:
+
+```ts
+export function assertDefined<T>(value: T, message: string): asserts value is NonNullable<T> {
+  if (value === null || value === undefined) throw new Error(message);
+}
+
+function invoiceRecipient(user: { id: string; emails: readonly string[] }): string {
+  const email = primaryEmail(user);
+  assertDefined(email, `el usuario ${user.id} no tiene correo corporativo`);
+  return email; // aquí email ya es string
+}
+```
+
+Para que no vuelva a entrar: activen `@typescript-eslint/no-non-null-assertion` en el linter. Habrá algún caso legítimo (un valor que el compilador no puede seguir); que lleve un comentario de desactivación con el motivo.
+
+Tests que pediría en el PR:
+
+```ts
+import assert from 'node:assert/strict';
+
+assert.equal(getDiscount('NOEXISTE', new Map()), 0);
+assert.equal(getDiscount('VERANO', new Map([['VERANO', 500]])), 500);
+assert.equal(primaryEmail({ emails: ['ana@gmail.com'] }), undefined);
+assert.equal(primaryEmail({ emails: ['Ana@empresa.com'] }), 'ana@empresa.com');
+```""",
+            },
+        ]
+    },
+    # 16) moduleResolution NodeNext, extensiones .js y alias en ejecución (intermedio-avanzado, multiturno)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": """Configuré `"module": "NodeNext"` en un proyecto de Node 22 con ESM y ahora tengo errores en todos los imports relativos:
+
+```
+src/server.ts:2:24 - error TS2835: Relative import paths need explicit file extensions in ECMAScript imports when '--moduleResolution' is 'node16' or 'nodenext'. Did you mean './routes.js'?
+
+2 import { routes } from './routes';
+```
+
+¿En serio tengo que poner `.js` si el archivo es `.ts`?""",
+            },
+            {
+                "role": "assistant",
+                "content": """Sí, y tiene lógica. Node, en modo ESM, **no adivina extensiones**: `import './routes'` falla en ejecución porque no existe ningún archivo llamado exactamente `routes`. Y `tsc` **no reescribe las rutas** de los imports al compilar. Así que escribes la ruta tal como existirá en ejecución (`./routes.js` en `dist/`), y TypeScript, al comprobar tipos, sabe que `./routes.js` corresponde a `./routes.ts`.
+
+```ts
+import { routes } from './routes.js';
+```
+
+Qué opción de `moduleResolution` corresponde a cada caso:
+
+| Opción | Para qué código |
+|---|---|
+| `nodenext` / `node16` | código que **Node ejecuta directamente** tras compilar con `tsc`; aplica las reglas de Node (extensiones, `exports`, ESM o CJS según `"type"`) |
+| `bundler` | código que pasa por Vite, esbuild, webpack o Bun; sin extensiones obligatorias |
+| `node10` (el antiguo `node`) | heredado; ignora `exports`. No lo uses en proyectos nuevos |
+
+Una configuración razonable para Node 22 con ESM:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "rootDir": "src",
+    "outDir": "dist",
+    "strict": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+```
+
+Hay una alternativa desde TypeScript 5.7: escribir los imports con `.ts` (`./routes.ts`) y activar `rewriteRelativeImportExtensions`, que los reescribe a `.js` al emitir. Es útil si además ejecutas los `.ts` directamente con Node, que exige la extensión real del archivo.
+
+Para corregir todos los imports, un buscar y reemplazar con regex en el editor basta. `tsc --noEmit` te señala cualquiera que se haya escapado, así que la comprobación es que compile sin errores TS2835.""",
+            },
+            {
+                "role": "user",
+                "content": "Listo, ya compila. Pero también tenía `paths` con `@/*` apuntando a `src/*`, y al ejecutar `node dist/server.js` truena con `Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@/config' imported from /app/dist/server.js`. En el editor todo bien.",
+            },
+            {
+                "role": "assistant",
+                "content": """Es la misma causa: **`paths` solo afecta a cómo TypeScript resuelve los tipos**, nunca reescribe el código emitido. En `dist/server.js` sigue poniendo `import ... from '@/config'`, y para Node un especificador que no empieza por `.` o `/` es el nombre de un paquete en `node_modules`. No existe, y de ahí el error. El editor no se queja porque usa la misma configuración de `paths` que el compilador.
+
+La solución nativa son los **subpath imports** de Node: alias definidos en el campo `imports` de `package.json`, que Node sí entiende en ejecución. Deben empezar por `#`:
+
+```json
+{
+  "type": "module",
+  "imports": {
+    "#src/*": "./dist/*"
+  }
+}
+```
+
+```ts
+// src/server.ts
+import { config } from '#src/config.js';
+```
+
+Cómo funciona en cada lado:
+
+- **En ejecución**, Node resuelve `#src/config.js` a `./dist/config.js`.
+- **Al comprobar tipos**, TypeScript ve que el destino está dentro de `outDir` y busca el archivo fuente equivalente en `rootDir` (`./src/config.ts`). Por eso `rootDir` y `outDir` tienen que estar declarados en el `tsconfig.json`; si falta `rootDir`, TypeScript avisa de que no puede deducir la raíz del proyecto.
+
+Después, **borra `paths`** del `tsconfig.json`. Dos sistemas de alias acaban divergiendo, y el que importa es el que entiende Node.
+
+Alternativas, y por qué no las elegiría aquí:
+
+- Herramientas que reescriben los alias tras compilar (`tsc-alias`): funcionan, pero añaden un paso de build que hace exactamente lo que `imports` ya resuelve sin dependencias.
+- Volver a imports relativos: válido y sin magia; el alias solo merece la pena si los `../../..` molestan de verdad.
+
+Comprobación completa:
+
+```bash
+grep -rn "from '@/" src || echo 'sin alias antiguos'
+npx tsc && node dist/server.js
+```
+
+Si arranca, la resolución en ejecución es correcta. Y como `tsc` ya resolvió `#src/config.js` hasta el `.ts`, un alias mal escrito falla al compilar, no en producción.""",
+            },
+        ]
+    },
+    # 17) Tuplas variádicas: envolver funciones conservando parámetros y retorno (avanzado)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Tengo varias funciones async con firmas distintas y quiero un `withRetry(fn)` que devuelva una función con EXACTAMENTE los mismos parámetros y el mismo retorno. Lo hice con `(...args: any[]) => Promise<any>` y pierdo todos los tipos.",
+            },
+            {
+                "role": "assistant",
+                "content": """Captura la lista de parámetros como un **parámetro de tipo de tupla** (`A extends unknown[]`) y el retorno como otro (`R`). TypeScript infiere ambos de la función que pasas y los reutiliza en la que devuelves, incluidos los nombres y los parámetros opcionales.
+
+```ts
+export function withRetry<A extends unknown[], R>(
+  fn: (...args: A) => Promise<R>,
+  { retries = 2, delayMs = 200 }: { retries?: number; delayMs?: number } = {},
+): (...args: A) => Promise<R> {
+  return async (...args: A): Promise<R> => {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        return await fn(...args);
+      } catch (error) {
+        lastError = error;
+        if (attempt < retries) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs * 2 ** attempt));
+        }
+      }
+    }
+    throw lastError;
+  };
+}
+```
+
+Uso:
+
+```ts
+interface Invoice { id: string; totalCents: number }
+
+async function fetchInvoice(id: string, options?: { includeLines: boolean }): Promise<Invoice> {
+  const query = options?.includeLines ? '?lines=1' : '';
+  const res = await fetch(`https://api.example.com/invoices/${encodeURIComponent(id)}${query}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as Invoice; // en código real, valida con un esquema
+}
+
+const fetchInvoiceWithRetry = withRetry(fetchInvoice);
+// (id: string, options?: { includeLines: boolean }) => Promise<Invoice>
+
+fetchInvoiceWithRetry('F-0042', { includeLines: true }); // bien
+fetchInvoiceWithRetry(42); // error: Argument of type 'number' is not assignable to parameter of type 'string'.
+```
+
+`A` se infiere como la tupla etiquetada `[id: string, options?: { includeLines: boolean }]`. Por eso el editor muestra los nombres originales al usar la función envuelta.
+
+Las tuplas variádicas también permiten **añadir o quitar** parámetros. Un ejemplo útil, fijar el primer argumento:
+
+```ts
+export function bindFirst<F, Rest extends unknown[], R>(
+  fn: (first: F, ...rest: Rest) => R,
+  first: F,
+): (...rest: Rest) => R {
+  return (...rest) => fn(first, ...rest);
+}
+
+function log(level: 'info' | 'error', message: string, meta?: Record<string, unknown>): void {
+  console.log(JSON.stringify({ level, message, ...meta }));
+}
+
+const logError = bindFirst(log, 'error'); // (message: string, meta?: Record<string, unknown>) => void
+logError('pago rechazado', { orderId: 'A-17' });
+```
+
+Y la notación para componer tuplas: `[H, ...T]` añade al principio y `[...A, ...B]` concatena.
+
+Una limitación: con una función **sobrecargada**, la inferencia toma solo la última sobrecarga. Si necesitas envolver una, escribe las sobrecargas del envoltorio a mano.
+
+Comprobación de tipos y de comportamiento:
+
+```ts
+import assert from 'node:assert/strict';
+
+const typed: (id: string, options?: { includeLines: boolean }) => Promise<Invoice> = fetchInvoiceWithRetry;
+// @ts-expect-error: el id debe ser string
+fetchInvoiceWithRetry(42);
+
+let calls = 0;
+const flaky = withRetry(async (n: number) => {
+  calls += 1;
+  if (calls < 3) throw new Error('fallo transitorio');
+  return n * 2;
+}, { delayMs: 1 });
+
+assert.equal(await flaky(21), 42);
+assert.equal(calls, 3);
+```
+
+Si quitas el genérico `A` y vuelves a `any[]`, la línea con `@ts-expect-error` deja de dar error y la compilación falla: ese test de tipos protege justo lo que pedías.""",
+            },
+        ]
+    },
+    # 18) Branded types para no mezclar ids (intermedio, usuario en español pide respuesta en inglés)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Necesito explicarle esto a un equipo de otro país en el PR, así que respóndeme en inglés, por favor: ¿cómo evito en TypeScript que alguien pase un `orderId` donde va un `userId`? Los dos son `string` y ya nos pasó un bug así en producción.",
+            },
+            {
+                "role": "assistant",
+                "content": r"""TypeScript compares types by structure, so two strings are always interchangeable, and `type UserId = string` is only an alias: it doesn't create a new type. To make them incompatible you add a **brand**, a phantom property that exists only at the type level.
+
+```ts
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+export type UserId = Brand<string, 'UserId'>;
+export type OrderId = Brand<string, 'OrderId'>;
+```
+
+`declare const` emits no JavaScript. The brand property never exists at runtime, so a `UserId` is still a plain string: zero cost, normal JSON, usable as a `Map` key.
+
+The only way to obtain a branded value is a constructor that validates, which is also the only place where a cast is allowed:
+
+```ts
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ORDER_ID_PATTERN = /^ord_\d+$/;
+
+export function toUserId(value: string): UserId {
+  if (!UUID_PATTERN.test(value)) throw new TypeError(`invalid UserId: ${value}`);
+  return value as UserId;
+}
+
+export function toOrderId(value: string): OrderId {
+  if (!ORDER_ID_PATTERN.test(value)) throw new TypeError(`invalid OrderId: ${value}`);
+  return value as OrderId;
+}
+```
+
+Now the bug you had is a compile error:
+
+```ts
+function cancelOrder(orderId: OrderId, requestedBy: UserId): void {
+  console.log(`order ${orderId} cancelled by ${requestedBy}`);
+}
+
+const userId = toUserId('3f2b8c1e-9a4d-4c2e-8f1a-2b3c4d5e6f70');
+const orderId = toOrderId('ord_1042');
+
+cancelOrder(orderId, userId); // fine
+cancelOrder(userId, orderId); // error: Argument of type 'UserId' is not assignable to parameter of type 'OrderId'.
+```
+
+Where to apply it:
+
+- **Brand at the boundaries, once**: when parsing route params, request bodies and database rows. Inside the domain, values are already branded and flow through without casts.
+- **If you validate with zod**, `z.string().uuid().brand<'UserId'>()` produces a branded output type. It uses zod's own brand marker, so pick one mechanism per codebase instead of mixing both.
+- **Don't brand everything.** It pays off where mix-ups are plausible and expensive: identifiers, and units such as cents vs. dollars or milliseconds vs. seconds.
+
+The trade-off to state in the PR: some ceremony at the edges (ORMs and HTTP libraries hand you plain strings, so the repository layer has to convert them), in exchange for making a whole class of production bugs impossible to compile.
+
+Tests that pin the guarantees, at the type level and at runtime:
+
+```ts
+import assert from 'node:assert/strict';
+
+// @ts-expect-error: a raw string is not a UserId
+const raw: UserId = '3f2b8c1e-9a4d-4c2e-8f1a-2b3c4d5e6f70';
+
+// @ts-expect-error: ids are not interchangeable
+cancelOrder(userId, orderId);
+
+assert.throws(() => toUserId('not-a-uuid'), TypeError);
+assert.equal(toOrderId('ord_7'), 'ord_7'); // still a plain string at runtime
+```""",
+            },
+        ]
+    },
+    # 19) Chequeo de tipos en JS puro con JSDoc y checkJs (principiante-intermedio)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Tenemos un proyecto en JS puro y no podemos migrar a TS todavía (el build es un lío). ¿Hay forma de tener chequeo de tipos sin renombrar archivos?",
+            },
+            {
+                "role": "assistant",
+                "content": """Sí. El compilador de TypeScript puede comprobar archivos `.js` y leer los tipos de comentarios **JSDoc**. No cambias el build ni la extensión: añades `typescript` como dependencia de desarrollo y un paso de chequeo.
+
+**1. Un archivo con tipos en JSDoc:**
+
+```js
+// @ts-check
+
+/**
+ * @typedef {object} CartLine
+ * @property {string} sku
+ * @property {number} unitPriceCents
+ * @property {number} qty
+ */
+
+/**
+ * Suma el total del carrito en céntimos.
+ * @param {CartLine[]} lines
+ * @param {{ discountCents?: number }} [options]
+ * @returns {number}
+ */
+export function cartTotal(lines, options = {}) {
+  const subtotal = lines.reduce((sum, line) => sum + line.unitPriceCents * line.qty, 0);
+  return Math.max(0, subtotal - (options.discountCents ?? 0));
+}
+
+cartTotal([{ sku: 'A1', unitPriceCents: '1999', qty: 1 }]);
+// error: Type 'string' is not assignable to type 'number'.
+```
+
+El comentario `// @ts-check` activa el chequeo en ese archivo. El editor (VS Code lo trae de serie) ya te subraya el error sin configurar nada más.
+
+**2. Lo que vas a necesitar del JSDoc:**
+
+```js
+/** @import { User } from './types.js' */          // importar tipos (TS 5.5+)
+/** @typedef {import('./types.js').Order} Order */ // forma anterior, sigue valiendo
+
+/**
+ * @template T
+ * @param {T[]} items
+ * @returns {T | undefined}
+ */
+export function first(items) {
+  return items[0];
+}
+
+const input = /** @type {HTMLInputElement} */ (document.querySelector('#q')); // aserción: paréntesis obligatorios
+```
+
+**3. Chequeo en el proyecto entero y en el CI:**
+
+```json
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": true,
+    "module": "NodeNext",
+    "target": "ES2022",
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+```
+
+```bash
+npm install --save-dev typescript
+npm pkg set scripts.typecheck="tsc -p tsconfig.json"
+```
+
+`noEmit` es la clave: TypeScript solo comprueba, nunca genera archivos, así que vuestro build no se entera.
+
+**4. Adopción gradual.** Activar `checkJs` en todo el proyecto de golpe puede dar cientos de errores. Dos caminos:
+
+- `checkJs: false` y `// @ts-check` en cada archivo que vayáis limpiando.
+- `checkJs: true` y `// @ts-nocheck` en los archivos todavía pendientes, para que todo lo nuevo nazca comprobado.
+
+El segundo es mejor en cuanto la mayoría de archivos esté limpia, porque el valor por defecto pasa a ser «comprobado».
+
+Comprobación: con el ejemplo de arriba, `npm run typecheck` debe fallar señalando la línea de `'1999'`. Cambia el valor por `1999` y debe pasar. Y si algún día migráis a TS, estos tipos se convierten casi uno a uno en anotaciones.""",
+            },
+        ]
+    },
+    # 20) Migración gradual de una app Express de JS a TS (avanzado, multiturno, ustedes)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Somos 6 devs con una app Express de unas 80k líneas en JS (CommonJS). Queremos pasarnos a TypeScript sin congelar features. ¿Por dónde empezamos?",
+            },
+            {
+                "role": "assistant",
+                "content": """Por fases pequeñas en las que **cada PR se puede desplegar**. La clave es que JS y TS convivan en el mismo build durante meses sin que nadie tenga que esperar a nadie.
+
+**Fase 0: infraestructura sin tocar código (1 PR).**
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowJs": true,
+    "checkJs": false,
+    "strict": true,
+    "esModuleInterop": true,
+    "rootDir": "src",
+    "outDir": "dist",
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+```
+
+- `allowJs` hace que `tsc` copie los `.js` a `dist/` junto con los `.ts` compilados: un solo build para todo.
+- `checkJs: false` deja el JS existente sin comprobar. Cero errores el primer día.
+- `strict: true` desde el principio: solo afecta a los `.ts`, que todavía no existen.
+- Con `"type": "commonjs"` en `package.json` y `module: NodeNext`, los `.ts` compilan a CommonJS y conviven con el resto. No activen `verbatimModuleSyntax` mientras sigan en CJS: les obligaría a escribir `import x = require(...)`.
+
+Producción pasa a ejecutar `node dist/server.js`. Ese es el único cambio de despliegue de toda la migración.
+
+**Fase 1: tipos en las fronteras.** Antes de convertir archivos, escriban los tipos que más valor dan: cuerpos de petición y respuesta, filas de la base de datos y configuración. Pueden vivir en `.ts` y usarse desde JS con JSDoc (`/** @type {import('./types').Order} */`).
+
+**Fase 2: convertir de las hojas hacia arriba.** Primero los módulos sin dependencias internas (utilidades, validadores), después servicios y por último rutas. Pocos archivos por PR, renombrados con `git mv` para conservar el historial.
+
+**Reglas del equipo desde el día uno:**
+
+- Ningún archivo `.js` nuevo en `src/`. El CI lo comprueba:
+
+```bash
+added_js=$(git diff --name-only --diff-filter=A origin/main -- 'src/*.js')
+if [ -n "$added_js" ]; then echo "Archivos JS nuevos: $added_js"; exit 1; fi
+```
+
+- `@ts-ignore` prohibido; `@ts-expect-error` permitido solo con explicación. En ESLint: `'@typescript-eslint/ban-ts-comment': ['error', { 'ts-expect-error': 'allow-with-description' }]`.
+- **Los PR de migración no cambian comportamiento.** Si al tipar aparece un bug, se anota y se arregla en un PR aparte, con su test. Mezclar las dos cosas hace imposible revisar ninguna.
+
+**Métrica semanal**, para saber si avanzan:
+
+```bash
+echo "JS: $(git ls-files 'src/*.js' | wc -l)  TS: $(git ls-files 'src/*.ts' | wc -l)"
+git grep -c '@ts-expect-error' -- 'src/*.ts' | awk -F: '{ total += $2 } END { print "ts-expect-error:", total + 0 }'
+```
+
+Con 6 personas convirtiendo 3 o 4 archivos por semana cada una, una base de 80k líneas suele quedar mayoritariamente en TS en unos meses, sin haber congelado nada.""",
+            },
+            {
+                "role": "user",
+                "content": "¿Strict desde el principio en serio? Hay quien en el equipo dice que con strict la migración se hace eterna y que mejor lo vamos subiendo después.",
+            },
+            {
+                "role": "assistant",
+                "content": """Sí, en serio, y el argumento es de coste total, no de purismo.
+
+Con `checkJs: false`, `strict` **no cuesta nada sobre el código existente**: solo se aplica a los archivos que ya convirtieron. El coste aparece archivo a archivo, en el momento de convertirlo, que es justo cuando alguien tiene ese código en la cabeza.
+
+Subirlo después significa **migrar dos veces**. Activar `strictNullChecks` sobre 80k líneas ya convertidas suele dar miles de errores de golpe, en archivos que nadie está tocando, y esa segunda migración es la que de verdad se eterniza o se abandona.
+
+Lo que `strict` les va a enseñar al convertir es exactamente lo que interesa encontrar. Ejemplo típico:
+
+```js
+// coupons.js (antes)
+function applyCoupon(order, coupon) {
+  if (coupon.expiresAt < Date.now()) return order;
+  return { ...order, totalCents: order.totalCents - coupon.amountCents };
+}
+```
+
+```ts
+// coupons.ts (conversión solo de tipos)
+export interface Order { id: string; totalCents: number }
+export interface Coupon { amountCents: number; expiresAt: number }
+
+export function applyCoupon(order: Order, coupon: Coupon): Order {
+  if (coupon.expiresAt < Date.now()) return order;
+  return { ...order, totalCents: order.totalCents - coupon.amountCents };
+}
+```
+
+Al convertir quien llama, `strictNullChecks` protesta en `applyCoupon(order, coupons.get(code))`: `Argument of type 'Coupon | undefined' is not assignable to parameter of type 'Coupon'`. Era un `TypeError` latente en producción para cualquier código de cupón inexistente. Sin `strict`, la conversión habría pasado limpia y el bug seguiría ahí.
+
+Siguiendo la regla de la fase 2, ese PR solo añade tipos. El arreglo va en otro PR, con su test:
+
+```ts
+const coupon = coupons.get(code);
+const finalOrder = coupon ? applyCoupon(order, coupon) : order;
+```
+
+Si un archivo concreto es demasiado difícil de convertir con `strict`, la salida no es bajar la configuración para todos, sino una de estas dos:
+
+1. Dejarlo en `.js` un tiempo más; con `allowJs` no bloquea a nadie.
+2. Convertirlo con algún `@ts-expect-error` explicado, que la métrica semanal hace visible.
+
+Comprobación del argumento con sus propios datos: en una rama, activen `checkJs: true` un momento y ejecuten `npx tsc --noEmit | grep -c 'error TS'`. Ese número es aproximadamente la deuda que estarían aplazando si dejan `strict` para el final.""",
+            },
+        ]
+    },
+    # 21) Tipos recursivos: JSON, DeepPartial y el límite de profundidad (avanzado, SISTEMA)
+    {
+        "messages": [
+            {"role": "system", "content": SISTEMA},
+            {
+                "role": "user",
+                "content": "Necesito tipar un JSON arbitrario (una columna `jsonb`) sin usar `any`, y también un `DeepPartial` para los overrides de configuración. Hice un DeepPartial propio y en un tipo grande me salta `Type instantiation is excessively deep and possibly infinite.`",
+            },
+            {
+                "role": "assistant",
+                "content": """Son dos tipos recursivos con problemas distintos. El de JSON es directo; el `DeepPartial` necesita **casos base** para no recorrer tipos que no debe.
+
+**1. JSON sin `any`:**
+
+```ts
+export type JsonPrimitive = string | number | boolean | null;
+export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+
+const settings: JsonValue = { theme: 'dark', sizes: [12, 14], beta: { enabled: true } };
+
+const bad1: JsonValue = { when: new Date() };  // error: Date tiene métodos, no es JSON
+const bad2: JsonValue = { note: undefined };    // error: undefined no existe en JSON
+```
+
+El tipo refleja exactamente lo que sobrevive a `JSON.stringify`, y por eso rechaza `Date` y `undefined`. Para leerlo tendrás que estrechar, como con `unknown`, pero dentro de un universo acotado:
+
+```ts
+export function isJsonObject(value: JsonValue): value is { [key: string]: JsonValue } {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+```
+
+**2. `DeepPartial` con casos base.** El error que viste aparece cuando la recursión entra en tipos enormes o recursivos: un `Date` (con todos sus métodos), funciones, el tipo de un cliente de ORM o el propio `JsonValue`. TypeScript corta a partir de cierta profundidad de instanciación. La solución es decidir explícitamente dónde **parar**:
+
+```ts
+type Leaf =
+  | string | number | boolean | bigint | symbol | null | undefined
+  | Date | RegExp | ((...args: never[]) => unknown);
+
+export type DeepPartial<T> =
+  T extends Leaf ? T
+  : T extends readonly unknown[] ? T // decisión: los arrays se sustituyen enteros
+  : { [K in keyof T]?: DeepPartial<T[K]> };
+```
+
+Por qué cada caso base:
+
+- `Date`, `RegExp` y funciones son valores atómicos para una configuración: no tiene sentido «la mitad de una fecha».
+- Los arrays se sustituyen enteros porque en overrides casi nunca se quiere fusionar por posición. Si en tu caso sí, cambia esa rama por `readonly DeepPartial<E>[]` con `infer E`.
+- `(...args: never[]) => unknown` acepta cualquier función sin recurrir a `any`.
+
+Si aun así lo aplicas a tipos muy profundos que no controlas, añade un contador de profundidad con una tupla:
+
+```ts
+type DeepPartialMax<T, Depth extends unknown[] = []> =
+  Depth['length'] extends 5 ? T
+  : T extends Leaf ? T
+  : T extends readonly unknown[] ? T
+  : { [K in keyof T]?: DeepPartialMax<T[K], [...Depth, unknown]> };
+```
+
+**3. La función que acompaña al tipo.** Un `DeepPartial` sin su fusión en ejecución es medio trabajo:
+
+```ts
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+export function deepMerge<T>(base: T, overrides: DeepPartial<T>): T {
+  if (!isPlainObject(base) || !isPlainObject(overrides)) {
+    return (overrides === undefined ? base : overrides) as T;
+  }
+  const result: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value !== undefined) result[key] = deepMerge(base[key], value as DeepPartial<unknown>);
+  }
+  return result as T;
+}
+```
+
+`isPlainObject` usa el mismo criterio que los casos base del tipo: un `Date`, un `Map` o un array no se recorren, se sustituyen. Tipo y función tienen que estar de acuerdo, o el tipo prometerá fusiones que la función no hace.
+
+Comprobación:
+
+```ts
+import assert from 'node:assert/strict';
+
+interface AppConfig {
+  server: { port: number; host: string };
+  features: { beta: boolean; flags: string[] };
+  startedAt: Date;
+}
+
+const base: AppConfig = {
+  server: { port: 3000, host: 'localhost' },
+  features: { beta: false, flags: ['a'] },
+  startedAt: new Date(0),
+};
+
+const merged = deepMerge(base, { server: { port: 8080 }, features: { flags: ['b'] } });
+assert.deepEqual(merged.server, { port: 8080, host: 'localhost' });
+assert.deepEqual(merged.features, { beta: false, flags: ['b'] }); // array sustituido
+assert.equal(merged.startedAt, base.startedAt);
+
+// @ts-expect-error: el puerto debe ser number
+deepMerge(base, { server: { port: '8080' } });
+```""",
+            },
+        ]
+    },
+    # 22) Sobrecargas, tipos de retorno dependientes y mapas de tipos (intermedio, multiturno)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Tengo una función `parseDate(input)` que acepta string o número (timestamp) y devuelve `Date`, pero si le paso `null` devuelve `null`. La tipé como `(input: string | number | null) => Date | null` y ahora tengo que comprobar `null` en todos lados aunque le pase un string. ¿Cómo hago que el retorno dependa del argumento?",
+            },
+            {
+                "role": "assistant",
+                "content": """La herramienta directa son las **sobrecargas**: varias firmas visibles para quien llama y una sola implementación.
+
+```ts
+export function parseDate(input: string | number): Date;
+export function parseDate(input: null): null;
+export function parseDate(input: string | number | null): Date | null;
+export function parseDate(input: string | number | null): Date | null {
+  if (input === null) return null;
+  const date = new Date(input);
+  if (Number.isNaN(date.getTime())) throw new RangeError(`fecha inválida: ${String(input)}`);
+  return date;
+}
+
+const a = parseDate('2024-05-01'); // Date
+const b = parseDate(null);         // null
+```
+
+Cómo se leen:
+
+- Las tres primeras son las **firmas públicas**. TypeScript las prueba en orden y usa la primera que encaja, así que van de la más específica a la más general.
+- La última es la **firma de implementación**: quien llama no la ve.
+- La tercera parece redundante, pero no lo es. Sin ella, `parseDate(maybeDate)` con `maybeDate: string | null` falla con `No overload matches this call`, porque ninguna firma individual acepta la unión.
+
+El punto débil, que conviene tener presente: TypeScript comprueba que la implementación sea **compatible** con las sobrecargas, pero no verifica cada rama del cuerpo contra cada firma. Si la implementación devolviera `null` para un string, las sobrecargas mentirían y nada lo detectaría. Los tests son los que cubren ese hueco.
+
+Antes de sobrecargar, pregúntate si no son **dos funciones**:
+
+```ts
+export function parseDate(input: string | number): Date {
+  const date = new Date(input);
+  if (Number.isNaN(date.getTime())) throw new RangeError(`fecha inválida: ${String(input)}`);
+  return date;
+}
+
+export function parseOptionalDate(input: string | number | null): Date | null {
+  return input === null ? null : parseDate(input);
+}
+```
+
+Sin firmas que puedan mentir, y el nombre dice lo que hace. Para este caso concreto, yo elegiría esta versión.
+
+Comprobación:
+
+```ts
+import assert from 'node:assert/strict';
+
+assert.ok(parseDate(0) instanceof Date);
+assert.equal(parseOptionalDate(null), null);
+assert.throws(() => parseDate('no es fecha'), RangeError);
+```""",
+            },
+            {
+                "role": "user",
+                "content": "Me gusta lo de separar. Pero tengo otro caso donde creo que sí vale: `createElement('a')` debería devolver `HTMLAnchorElement`, `createElement('canvas')` un `HTMLCanvasElement`... ¿también con sobrecargas?",
+            },
+            {
+                "role": "assistant",
+                "content": """Ahí no: con decenas de etiquetas tendrías decenas de sobrecargas. Cuando el tipo de retorno depende de **una clave entre muchas**, lo que escala es un **mapa de tipos** más un genérico indexado. Es exactamente lo que hace la librería del DOM con `HTMLElementTagNameMap`, así que puedes apoyarte en ella:
+
+```ts
+export function createElement<K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  className?: string,
+): HTMLElementTagNameMap[K] {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  return element;
+}
+
+const link = createElement('a', 'nav-link'); // HTMLAnchorElement
+link.href = '/inicio';
+
+const canvas = createElement('canvas');       // HTMLCanvasElement
+const context = canvas.getContext('2d');
+```
+
+No hace falta ningún `as`: `document.createElement` ya está tipado con ese mismo mapa, y `K` se propaga.
+
+El patrón sirve igual para tu dominio. Por ejemplo, un cliente HTTP donde cada ruta tiene su tipo de respuesta:
+
+```ts
+interface Endpoints {
+  '/users': { id: string; name: string }[];
+  '/stats': { total: number; active: number };
+}
+
+export async function getJson<P extends keyof Endpoints>(path: P): Promise<Endpoints[P]> {
+  const res = await fetch(`https://api.example.com${path}`);
+  if (!res.ok) throw new Error(`GET ${path} -> HTTP ${res.status}`);
+  return (await res.json()) as Endpoints[P]; // en producción, valida con un esquema por ruta
+}
+
+const stats = await getJson('/stats'); // { total: number; active: number }
+```
+
+Añadir una ruta es añadir una línea a `Endpoints`, no una firma nueva.
+
+Resumen para decidir:
+
+| Situación | Herramienta |
+|---|---|
+| El retorno depende de una clave entre muchas | mapa de tipos + `K extends keyof Mapa` |
+| Pocas firmas con formas o número de argumentos distintos | sobrecargas |
+| Dos comportamientos que se pueden nombrar | dos funciones |
+
+Comprobación de tipos:
+
+```ts
+const anchor: HTMLAnchorElement = createElement('a');
+// @ts-expect-error: no es una etiqueta HTML conocida
+createElement('botón');
+// @ts-expect-error: ruta no declarada en Endpoints
+getJson('/orders');
+```""",
+            },
+        ]
+    },
+    # 23) type frente a interface: diferencias técnicas reales (inglés, intermedio)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "type or interface? Our team argues about it in every PR. Is there an actual technical difference in TS 5.x, or is it pure style?",
+            },
+            {
+                "role": "assistant",
+                "content": """For plain object shapes they're interchangeable most of the time. There are four real differences, and only two of them tend to matter in practice.
+
+| | `interface` | `type` |
+|---|---|---|
+| Object shapes | yes | yes |
+| Unions, tuples, mapped and conditional types | no | yes |
+| Declaration merging | yes | no (duplicate identifier error) |
+| Conflicting members when combining | error at `extends` | silent `never` with `&` |
+| Assignable to `Record<string, unknown>` | no | yes |
+
+**1. Declaration merging.** Two interfaces with the same name in the same scope merge into one. That's how you augment library types (Express's `Request`, the global `Window`), and it's also a trap if it happens by accident:
+
+```ts
+interface Settings { theme: string }
+interface Settings { fontSize: number }
+
+const settings: Settings = { theme: 'dark' };
+// error: Property 'fontSize' is missing in type '{ theme: string; }' but required in type 'Settings'.
+```
+
+**2. `extends` reports conflicts; `&` hides them.** This is the strongest technical argument for interfaces when you build hierarchies:
+
+```ts
+interface Base { id: string }
+
+interface Child extends Base { id: number }
+// error: Interface 'Child' incorrectly extends interface 'Base'.
+
+type ChildT = Base & { id: number }; // compiles: id is string & number, which is never
+```
+
+With the intersection you find out much later, when no value can ever satisfy `ChildT`.
+
+**3. Implicit index signatures.** Object type aliases are assignable to `Record<string, unknown>`; interfaces aren't, because they could be augmented later with members of any type:
+
+```ts
+interface PointI { x: number }
+type PointT = { x: number };
+
+declare const pointT: PointT;
+declare const pointI: PointI;
+
+const okT: Record<string, unknown> = pointT;
+const badI: Record<string, unknown> = pointI;
+// error: Index signature for type 'string' is missing in type 'PointI'.
+```
+
+This bites with generic helpers constrained to `Record<string, unknown>`.
+
+**4. Performance in very large codebases.** The compiler caches relationships between named interfaces, while big intersections are recomputed. The TypeScript team's performance guidance prefers `interface ... extends` over large `&` chains. You'll only notice it in projects with heavy type hierarchies.
+
+A rule that ends the PR debates:
+
+- `interface` for object shapes that are extended or implemented: domain models, public contracts.
+- `type` for everything else: unions, function types, tuples, mapped and conditional types.
+
+Then let the linter enforce it, so nobody has to argue in review: `@typescript-eslint/consistent-type-definitions` set to `'interface'` flags object types declared with `type`.
+
+To check the claims above, paste the snippets into one file and run `npx tsc --noEmit`. You should get exactly three errors (the merged `Settings`, `Child`, and `badI`), while `ChildT` compiles without complaint. That silent line is the argument.""",
+            },
+        ]
+    },
+    # 24) Objetos que se construyen por partes: {} y Partial (principiante, multiturno, error concreto)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": """Soy nuevo en TS. Hago esto y me da error:
+
+```ts
+const user = {};
+user.name = 'Ana';   // Property 'name' does not exist on type '{}'.
+user.age = 30;
+```
+
+En JS funcionaba perfecto.""",
+            },
+            {
+                "role": "assistant",
+                "content": """TypeScript fija el tipo de una variable **en el momento de declararla**, a partir de su valor inicial. `{}` es un objeto sin propiedades, así que `user` queda con tipo `{}` para siempre, y añadirle `name` después no está permitido. En JS el objeto es una bolsa a la que añades lo que quieras; en TS su forma se conoce de antemano.
+
+Tres maneras de escribirlo, según el caso:
+
+**1. Crear el objeto completo de una vez** (la mejor si tienes los datos):
+
+```ts
+const user = { name: 'Ana', age: 30 }; // tipo inferido: { name: string; age: number }
+```
+
+**2. Declarar la forma primero**, si algunas propiedades llegan después:
+
+```ts
+interface User {
+  name: string;
+  age: number;
+  email?: string; // opcional: puede no estar
+}
+
+const user: User = { name: 'Ana', age: 30 };
+user.email = 'ana@example.com'; // bien: email está en el tipo
+```
+
+**3. Si las claves son de verdad dinámicas** (un diccionario), dilo con el tipo:
+
+```ts
+const scores: Record<string, number> = {};
+scores['ana'] = 10;
+scores['luis'] = 7;
+```
+
+Lo que **no** conviene hacer es `const user: any = {}`. El error desaparece, pero también cualquier ayuda del compilador para esa variable.
+
+Por qué esta regla te protege: en JS, `user.nmae = 'Ana'` (con una errata) crea en silencio una propiedad nueva y `user.name` sigue vacío. En TS es un error de compilación en esa misma línea.""",
+            },
+            {
+                "role": "user",
+                "content": "¿Y si el objeto se va armando en un bucle a partir de un formulario y al final tiene que ser un `User` completo? Si lo declaro como `User` desde el principio me pide todos los campos.",
+            },
+            {
+                "role": "assistant",
+                "content": """Usa `Partial<User>` mientras lo construyes (todas las propiedades pasan a ser opcionales) y, al final, **comprueba** que están las obligatorias antes de devolver un `User`:
+
+```ts
+interface User {
+  name: string;
+  age: number;
+  email?: string;
+}
+
+export function buildUser(fields: Map<string, string>): User {
+  const draft: Partial<User> = {};
+
+  for (const [key, value] of fields) {
+    if (key === 'name') draft.name = value.trim();
+    else if (key === 'age') draft.age = Number(value);
+    else if (key === 'email') draft.email = value.trim();
+  }
+
+  if (draft.name === undefined || draft.age === undefined || Number.isNaN(draft.age)) {
+    throw new Error('faltan campos obligatorios o no son válidos: name y age');
+  }
+
+  // aquí TypeScript ya sabe que name es string y age es number
+  return { name: draft.name, age: draft.age, email: draft.email };
+}
+```
+
+La clave está en el `if`: después de comprobar que `draft.name` y `draft.age` no son `undefined`, TypeScript **estrecha** sus tipos, y el objeto del `return` cumple `User` sin trucos.
+
+La tentación habitual es terminar con `return draft as User;`. Compila siempre, incluso si falta `age`, porque `as` le dice al compilador «confía en mí». El bug aparecería más tarde, en otra parte del código. Con el `return` explícito, si un día añades un campo obligatorio a `User` y olvidas comprobarlo, el compilador te lo señala justo ahí.
+
+Prueba rápida:
+
+```ts
+import assert from 'node:assert/strict';
+
+const user = buildUser(new Map([['name', ' Ana '], ['age', '30']]));
+assert.equal(user.name, 'Ana');
+assert.equal(user.age, 30);
+assert.equal(user.email, undefined);
+
+assert.throws(() => buildUser(new Map([['name', 'Ana']])), /faltan campos/);
+assert.throws(() => buildUser(new Map([['name', 'Ana'], ['age', 'treinta']])), /faltan campos/);
+```
+
+El último caso importa: `Number('treinta')` es `NaN`, que es de tipo `number`. Sin la comprobación de `Number.isNaN`, el tipo estaría contento y el dato sería basura.""",
+            },
+        ]
+    },
+    # 25) Mapped types con remapeo de claves: getters y filtrado por tipo de valor (avanzado)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Tengo un objeto de configuración tipado y quiero generar automáticamente un tipo con getters (`getPort()`, `getHost()`), y otro con solo las claves cuyo valor es una función. ¿Se puede con mapped types?",
+            },
+            {
+                "role": "assistant",
+                "content": """Sí, con el **remapeo de claves** (`as` dentro de un mapped type, desde TS 4.1). Permite transformar cada clave con un template literal type o descartarla devolviendo `never`.
+
+**1. Getters a partir de las claves:**
+
+```ts
+type Getters<T> = {
+  [K in keyof T & string as `get${Capitalize<K>}`]: () => T[K];
+};
+
+interface ServerConfig { port: number; host: string; tls: boolean }
+
+type ServerGetters = Getters<ServerConfig>;
+// { getPort: () => number; getHost: () => string; getTls: () => boolean }
+```
+
+El `& string` deja fuera las claves numéricas y de tipo `symbol`, con las que `Capitalize` no puede operar.
+
+**2. Filtrar claves por el tipo de su valor**: si la cláusula `as` produce `never`, la clave desaparece del resultado.
+
+```ts
+type PickByValue<T, V> = {
+  [K in keyof T as T[K] extends V ? K : never]: T[K];
+};
+
+type FunctionKeys<T> = keyof PickByValue<T, (...args: never[]) => unknown>;
+
+interface User { id: string; name: string }
+
+interface UserService {
+  baseUrl: string;
+  retries: number;
+  getUser(id: string): Promise<User>;
+  deleteUser(id: string): Promise<void>;
+}
+
+type UserServiceMethods = FunctionKeys<UserService>; // 'getUser' | 'deleteUser'
+type UserServiceData = PickByValue<UserService, string | number>; // { baseUrl: string; retries: number }
+```
+
+`(...args: never[]) => unknown` acepta cualquier función: un parámetro de tipo `never` es asignable a cualquier otro, así que no hace falta `any`.
+
+**3. La implementación en ejecución** que corresponde al tipo de getters:
+
+```ts
+export function createGetters<T extends object>(source: T): Getters<T> {
+  const getters: Record<string, () => unknown> = {};
+  for (const key of Object.keys(source) as (keyof T & string)[]) {
+    const name = `get${key.charAt(0).toUpperCase()}${key.slice(1)}`;
+    getters[name] = () => source[key];
+  }
+  return getters as Getters<T>;
+}
+```
+
+Hay dos `as`, y ambos están justificados: `Object.keys` devuelve `string[]` porque TypeScript no puede garantizar que no haya claves extra, y el objeto se construye dinámicamente. La comprobación de abajo es la que verifica que tipo y función coinciden.
+
+**4. Los modificadores también se pueden quitar o poner** con `-` y `+`:
+
+```ts
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+type Complete<T> = { [K in keyof T]-?: T[K] };
+```
+
+Comprobación de tipos y de ejecución:
+
+```ts
+import assert from 'node:assert/strict';
+
+const getters = createGetters({ port: 3000, host: 'localhost' });
+const port: number = getters.getPort();
+assert.equal(port, 3000);
+assert.equal(getters.getHost(), 'localhost');
+
+// @ts-expect-error: no hay getter para una clave que no existe
+getters.getPassword();
+
+const methods: UserServiceMethods[] = ['getUser', 'deleteUser'];
+// @ts-expect-error: baseUrl no es un método
+const notAMethod: UserServiceMethods = 'baseUrl';
+```
+
+Un límite a tener en cuenta: `Capitalize` en tipos y `toUpperCase()` en ejecución coinciden para claves ASCII. Con claves que empiecen por caracteres poco habituales, compruébalo antes de confiar en que ambos lados generan el mismo nombre.""",
+            },
+        ]
+    },
+    # 26) Indexar con un string: TS7053, keyof typeof y Object.hasOwn (intermedio, código roto)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": """No entiendo este error, el objeto tiene esas claves:
+
+```ts
+const prices = { basic: 10, pro: 25, enterprise: 99 };
+
+function priceFor(plan: string) {
+  return prices[plan];
+}
+// Element implicitly has an 'any' type because expression of type 'string' can't be used to index type '{ basic: number; pro: number; enterprise: number; }'.
+//   No index signature with a parameter of type 'string' was found on type '{ basic: number; pro: number; enterprise: number; }'.
+```
+
+Y me pasa lo mismo con `Object.keys(prices).forEach((key) => prices[key])`.""",
+            },
+            {
+                "role": "assistant",
+                "content": """El objeto tiene esas tres claves, pero `plan` es un `string` cualquiera. Nada impide llamar a `priceFor('free')`, y entonces `prices['free']` sería `undefined` en ejecución. TypeScript no sabe qué tipo darle a ese acceso, así que se niega a inventar un `any`.
+
+Hay tres arreglos según de dónde venga la clave.
+
+**1. La clave la controla tu código: restringe el tipo del parámetro.**
+
+```ts
+const prices = { basic: 10, pro: 25, enterprise: 99 } as const;
+
+type Plan = keyof typeof prices; // 'basic' | 'pro' | 'enterprise'
+
+export function priceFor(plan: Plan): number {
+  return prices[plan];
+}
+```
+
+`keyof typeof prices` deriva la unión del propio objeto: si añades un plan, el tipo se actualiza solo.
+
+**2. La clave llega de fuera (un query string, un formulario): valídala con un guard.**
+
+```ts
+export function isPlan(value: string): value is Plan {
+  return Object.hasOwn(prices, value);
+}
+
+const requested = new URLSearchParams(location.search).get('plan') ?? '';
+const price = isPlan(requested) ? priceFor(requested) : undefined;
+```
+
+Ojo con usar `value in prices` en lugar de `Object.hasOwn`: `'toString' in prices` es `true`, porque `in` mira también el prototipo. Tu guard aceptaría `'toString'` como plan y `prices['toString']` devolvería una función. `Object.hasOwn` (ES2022; necesitas `"lib": ["ES2022"]` o superior) solo mira las propiedades propias.
+
+**3. Es un diccionario de verdad** (las claves no se conocen de antemano): decláralo así.
+
+```ts
+const pricesByCountry: Record<string, number> = { CO: 45_000, MX: 199 };
+const price = pricesByCountry['AR']; // number, o number | undefined con noUncheckedIndexedAccess
+```
+
+**Sobre `Object.keys`:** devuelve `string[]` a propósito. Como los tipos son estructurales, un objeto puede llevar en ejecución más claves de las que declara su tipo, y TypeScript no promete lo que no puede garantizar. Para recorrer, `Object.entries` ya te da los valores tipados:
+
+```ts
+for (const [plan, price] of Object.entries(prices)) {
+  console.log(`${plan}: ${price}`); // plan: string, price: 10 | 25 | 99
+}
+```
+
+Si necesitas las claves tipadas y el objeto es un literal tuyo (no un parámetro que pueda traer extras), una aserción local es aceptable: `(Object.keys(prices) as Plan[])`.
+
+Comprobación:
+
+```ts
+import assert from 'node:assert/strict';
+
+assert.equal(priceFor('pro'), 25);
+assert.equal(isPlan('basic'), true);
+assert.equal(isPlan('toString'), false);
+assert.equal(isPlan('free'), false);
+
+// @ts-expect-error: 'free' no es un plan
+priceFor('free');
+```""",
+            },
+        ]
+    },
+    # 27) Tipar código asíncrono: tuplas en Promise.all y promesas flotantes (intermedio, system: rioplatense, multiturno)
+    {
+        "messages": [
+            {"role": "system", "content": "Respondé en español rioplatense, directo y con código."},
+            {
+                "role": "user",
+                "content": "Tengo `const [user, orders] = await Promise.all([getUser(id), getOrders(id)]);` y TS infiere bien cada tipo. Pero si armo el array antes en una variable, `const tasks = [getUser(id), getOrders(id)]`, y hago `Promise.all(tasks)`, me quedan los dos como `User | Order[]`. ¿Por qué?",
+            },
+            {
+                "role": "assistant",
+                "content": """Porque un array literal guardado en una variable se infiere como **array de una unión**, no como tupla. Para TypeScript, `tasks` es `(Promise<User> | Promise<Order[]>)[]`: una lista de cualquier largo donde cada elemento puede ser cualquiera de los dos. Se pierde la información de qué hay en cada posición, y `Promise.all` no la puede recuperar.
+
+Cuando el array va escrito directo en la llamada, la firma de `Promise.all` le da un **contexto** que hace que TypeScript lo infiera como tupla `[Promise<User>, Promise<Order[]>]`, y por eso cada posición conserva su tipo.
+
+Para la variable, `as const` alcanza:
+
+```ts
+interface User { id: string; name: string }
+interface Order { id: string; totalCents: number }
+
+declare function getUser(id: string): Promise<User>;
+declare function getOrders(userId: string): Promise<Order[]>;
+
+async function loadDashboard(id: string) {
+  const tasks = [getUser(id), getOrders(id)] as const; // readonly [Promise<User>, Promise<Order[]>]
+  const [user, orders] = await Promise.all(tasks);      // User y Order[]
+  return { user, orderCount: orders.length };
+}
+```
+
+Dos herramientas más que te van a servir con código async:
+
+```ts
+// el tipo que resuelve una función async, sin declararlo a mano
+type Dashboard = Awaited<ReturnType<typeof loadDashboard>>;
+// { user: User; orderCount: number }
+
+// Promise.allSettled también conserva la tupla
+const [userResult, ordersResult] = await Promise.allSettled([getUser('1'), getOrders('1')] as const);
+if (userResult.status === 'fulfilled') {
+  console.log(userResult.value.name); // value: User
+}
+```
+
+Comprobación: con `const check: [User, Order[]] = await Promise.all(tasks);` el archivo compila con `as const` y falla sin él.""",
+            },
+            {
+                "role": "user",
+                "content": "Joya. Otra: un compañero llamó a `saveAudit(event)` sin `await` dentro de un handler y nadie se dio cuenta hasta que empezaron a perderse auditorías. ¿TS no avisa de eso?",
+            },
+            {
+                "role": "assistant",
+                "content": """No, y no es un descuido del compilador: llamar a una función que devuelve una promesa sin esperarla es JavaScript válido (es el patrón «disparar y olvidar»). TypeScript no puede saber si lo hiciste a propósito.
+
+Qué pasó seguramente con las auditorías: el handler terminó y respondió sin esperar a `saveAudit`. Si esa promesa fallaba, nadie la observaba; y en entornos serverless, el runtime puede congelar o matar la instancia apenas se envía la respuesta, con la escritura a medio hacer.
+
+Lo que sí lo detecta es **`typescript-eslint` con reglas que usan la información de tipos**. La que buscás es `@typescript-eslint/no-floating-promises`, incluida en `recommendedTypeChecked`:
+
+```js
+// eslint.config.js
+import js from '@eslint/js';
+import tseslint from 'typescript-eslint';
+
+export default [
+  js.configs.recommended,
+  ...tseslint.configs.recommendedTypeChecked,
+  {
+    languageOptions: {
+      parserOptions: {
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+  },
+];
+```
+
+`projectService: true` le da al linter acceso al `tsconfig.json`, que necesita para saber qué expresiones son promesas. Con eso, la línea de tu compañero da un error que empieza con `Promises must be awaited, end with a call to .catch, ...`.
+
+La regla te obliga a decidir de forma explícita entre tres opciones:
+
+```ts
+// 1. Lo normal: esperar. Si falla, el error llega al manejador del handler.
+await saveAudit(event);
+
+// 2. Si de verdad no puede demorar la respuesta: no esperar, pero manejar el fallo.
+void saveAudit(event).catch((error: unknown) => {
+  console.error('no se pudo guardar la auditoría', error);
+});
+
+// 3. Si se puede perder, mandala a una cola con reintentos, no a una promesa suelta.
+```
+
+El `void` le dice al linter y al que lee «esto es a propósito». Para una auditoría, igual yo iría por la opción 1: que se pierdan registros suele ser peor que unos milisegundos más de respuesta.
+
+En la misma configuración viene `no-misused-promises`, que agarra el primo de este bug: pasar una función `async` donde se espera un callback que devuelve `void` (por ejemplo, a `forEach` o a un `addEventListener`).
+
+Comprobación: agregá un archivo con `saveAudit(event);` suelto, corré `npx eslint .` y tiene que fallar; con `await` delante, tiene que pasar. Sumá ese `npx eslint .` al CI para que no dependa de que alguien se acuerde.""",
+            },
+        ]
+    },
+    # 28) Bus de eventos tipado con genéricos y mapas de eventos (avanzado, SISTEMA)
+    {
+        "messages": [
+            {"role": "system", "content": SISTEMA},
+            {
+                "role": "user",
+                "content": "Quiero un bus de eventos tipado para el frontend: `bus.on('cart:updated', (payload) => ...)` debe conocer el tipo del payload según el nombre del evento, y `emit` debe exigir el payload correcto. Sin librerías.",
+            },
+            {
+                "role": "assistant",
+                "content": """La pieza central es un **mapa de eventos**: un tipo que asocia cada nombre con su payload. Todos los métodos son genéricos en la clave (`K extends keyof Events`) y usan `Events[K]` para el payload, así que nombre y payload no pueden desacoplarse.
+
+```ts
+// typed-event-bus.ts
+type Listener<P> = (payload: P) => void;
+
+export class TypedEventBus<Events extends Record<string, unknown>> {
+  #listeners: { [K in keyof Events]?: Set<Listener<Events[K]>> } = {};
+  readonly #onListenerError: (error: unknown) => void;
+
+  constructor(
+    onListenerError: (error: unknown) => void = (error) => queueMicrotask(() => { throw error; }),
+  ) {
+    this.#onListenerError = onListenerError;
+  }
+
+  on<K extends keyof Events>(event: K, listener: Listener<Events[K]>): () => void {
+    const listeners = (this.#listeners[event] ??= new Set<Listener<Events[K]>>());
+    listeners.add(listener);
+    return () => this.off(event, listener); // devolver la baja evita guardar referencias a mano
+  }
+
+  off<K extends keyof Events>(event: K, listener: Listener<Events[K]>): void {
+    this.#listeners[event]?.delete(listener);
+  }
+
+  emit<K extends keyof Events>(event: K, payload: Events[K]): void {
+    for (const listener of [...(this.#listeners[event] ?? [])]) {
+      try {
+        listener(payload);
+      } catch (error) {
+        this.#onListenerError(error); // un listener roto no impide que se ejecuten los demás
+      }
+    }
+  }
+}
+```
+
+Uso:
+
+```ts
+type AppEvents = {
+  'cart:updated': { itemCount: number; totalCents: number };
+  'user:logged-out': undefined;
+};
+
+export const bus = new TypedEventBus<AppEvents>();
+
+const unsubscribe = bus.on('cart:updated', (payload) => {
+  console.log(`${payload.itemCount} productos`); // payload ya tipado
+});
+
+bus.emit('cart:updated', { itemCount: 2, totalCents: 4598 });
+bus.emit('user:logged-out', undefined);
+unsubscribe();
+
+bus.emit('cart:updated', { itemCount: 2 });
+// error: Property 'totalCents' is missing in type '{ itemCount: number; }'...
+bus.on('cart:updpated', () => {});
+// error: Argument of type '"cart:updpated"' is not assignable to parameter of type 'keyof AppEvents'.
+```
+
+Decisiones que no son obvias:
+
+- **`AppEvents` es un `type`, no una `interface`.** La restricción `Record<string, unknown>` exige una firma de índice implícita, y las interfaces no la tienen (podrían ampliarse después). Con `interface` obtendrías un error en `new TypedEventBus<AppEvents>()`.
+- **Se itera sobre una copia** (`[...set]`). Si un listener se da de alta durante el `emit`, un `Set` lo visitaría en esa misma pasada, y uno que se vuelve a suscribir a sí mismo produciría un bucle infinito.
+- **Errores aislados.** Por defecto se relanzan en una microtarea: aparecen en la consola y en tu monitorización como errores no capturados, pero sin cortar a los demás listeners. El manejador se inyecta para poder controlarlo en los tests.
+- **`on` devuelve la función de baja.** Encaja con el `useEffect` de React o el `onUnmounted` de Vue (`return bus.on(...)`) y evita fugas de listeners.
+
+Tests:
+
+```ts
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { TypedEventBus } from './typed-event-bus.js';
+
+type TestEvents = { 'cart:updated': { itemCount: number; totalCents: number } };
+
+test('entrega el payload y respeta la baja', () => {
+  const bus = new TypedEventBus<TestEvents>();
+  const seen: number[] = [];
+  const unsubscribe = bus.on('cart:updated', (payload) => seen.push(payload.itemCount));
+
+  bus.emit('cart:updated', { itemCount: 1, totalCents: 100 });
+  unsubscribe();
+  bus.emit('cart:updated', { itemCount: 2, totalCents: 200 });
+
+  assert.deepEqual(seen, [1]);
+});
+
+test('un listener que lanza no impide que se ejecuten los demás', () => {
+  const errors: unknown[] = [];
+  const bus = new TypedEventBus<TestEvents>((error) => errors.push(error));
+  const seen: number[] = [];
+
+  bus.on('cart:updated', () => { throw new Error('boom'); });
+  bus.on('cart:updated', (payload) => seen.push(payload.itemCount));
+  bus.emit('cart:updated', { itemCount: 3, totalCents: 300 });
+
+  assert.deepEqual(seen, [3]);
+  assert.equal(errors.length, 1);
+});
+```""",
+            },
+        ]
+    },
+    # 29) verbatimModuleSyntax e import type (intermedio, error concreto)
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": """Activé `verbatimModuleSyntax` porque venía en la plantilla de Vite y ahora tengo esto en un montón de archivos:
+
+```
+src/api.ts:1:10 - error TS1484: 'User' is a type and must be imported using a type-only import when 'verbatimModuleSyntax' is enabled.
+
+1 import { User, fetchUser } from './users';
+```
+
+¿Para qué sirve? Antes compilaba sin problema.""",
+            },
+            {
+                "role": "assistant",
+                "content": """Sirve para que **todas las herramientas de tu cadena estén de acuerdo** sobre qué imports existen en ejecución.
+
+El problema que resuelve: Vite transforma cada archivo `.ts` por separado con esbuild, sin mirar los demás archivos. Al ver `import { User, fetchUser } from './users'`, esbuild no puede saber si `User` es un tipo (que hay que borrar) o un valor (que hay que conservar), porque esa información está en `users.ts`. Si lo conserva y resulta ser un tipo, el navegador falla al cargar el módulo con un error del estilo `The requested module './users.ts' does not provide an export named 'User'`. `tsc` sí lo sabía y borraba esos imports, y por eso «antes compilaba».
+
+Con `verbatimModuleSyntax`, la regla es simple y local: **se emite exactamente lo que escribiste, menos lo marcado con `type`**. Cualquier herramienta puede aplicarla mirando un solo archivo. El precio es marcar tú los imports de tipos:
+
+```ts
+import { fetchUser, type User } from './users';
+```
+
+o, si todo lo que importas son tipos:
+
+```ts
+import type { User, Role } from './users';
+```
+
+La diferencia entre las dos formas importa:
+
+| Escribes | Se emite |
+|---|---|
+| `import type { User } from './users'` | nada: la línea desaparece entera |
+| `import { type User } from './users'` | `import {} from './users'`: el módulo se sigue cargando por sus efectos secundarios |
+
+Si el módulo solo aporta tipos, usa `import type`, para no cargarlo en ejecución sin necesidad.
+
+Lo mismo aplica a las reexportaciones: `export { User } from './users'` para un tipo da error y hay que escribir `export type { User } from './users'`.
+
+**No lo arregles a mano en cada archivo.** La regla `@typescript-eslint/consistent-type-imports` lo hace con autofix:
+
+```js
+// en eslint.config.js, dentro de rules
+'@typescript-eslint/consistent-type-imports': ['error', { prefer: 'type-imports', fixStyle: 'separate-type-imports' }],
+```
+
+```bash
+npx eslint . --fix
+```
+
+Y algo relacionado que conviene saber de Vite: **el servidor de desarrollo no comprueba tipos**, solo los borra. Un error de tipos no impide que la app arranque. Por eso la plantilla define el build como `tsc -b && vite build`; asegúrate de que el CI ejecute ese build, o un `tsc --noEmit` aparte.
+
+Comprobación:
+
+```bash
+npx eslint . --fix
+npx tsc --noEmit       # sin errores TS1484
+npx vite build         # el bundle se genera
+```
+
+Si el build pasa y antes fallaba en el navegador con un `does not provide an export named`, era exactamente este problema.""",
+            },
+        ]
+    },
+    # 30) Clases en TS: private frente a #, readonly, protected y abstract (principiante, system: mentor)
+    {
+        "messages": [
+            {
+                "role": "system",
+                "content": "Eres un mentor paciente para desarrolladores junior. Explicas con ejemplos pequeños y señalas los errores comunes.",
+            },
+            {
+                "role": "user",
+                "content": "En TypeScript veo clases con `private`, otras con `#`, `readonly`, `protected`, `abstract`... me pierdo. ¿Cuál uso y cuándo?",
+            },
+            {
+                "role": "assistant",
+                "content": """La clave para no perderte: algunas de esas palabras son **de TypeScript** (solo existen al compilar) y una es **de JavaScript** (existe también en ejecución).
+
+| Palabra | De quién | Qué hace |
+|---|---|---|
+| `#campo` | JavaScript | privado de verdad, también en ejecución |
+| `private` | TypeScript | privado solo para el compilador |
+| `protected` | TypeScript | accesible en la clase y en sus subclases |
+| `readonly` | TypeScript | no se puede reasignar después del constructor |
+| `abstract` | TypeScript | clase que no se instancia, o método que las subclases deben implementar |
+
+Un ejemplo que usa todas:
+
+```ts
+export abstract class Notifier {
+  #sent = 0;                            // privado real
+  protected readonly retries: number;   // visible para subclases, no reasignable
+
+  constructor(retries = 2) {
+    this.retries = retries;
+  }
+
+  async notify(to: string, message: string): Promise<void> {
+    await this.send(to, message);
+    this.#sent += 1;
+  }
+
+  get sentCount(): number {
+    return this.#sent;
+  }
+
+  // cada subclase decide cómo se envía
+  protected abstract send(to: string, message: string): Promise<void>;
+}
+
+export class ConsoleNotifier extends Notifier {
+  protected override async send(to: string, message: string): Promise<void> {
+    console.log(`[para ${to}] ${message}`);
+  }
+}
+```
+
+Y lo que pasa al usarlo:
+
+```ts
+const notifier = new ConsoleNotifier();
+await notifier.notify('ana@example.com', 'Tu pedido salió');
+
+console.log(notifier.sentCount);       // 1
+console.log(JSON.stringify(notifier)); // {"retries":2}  <- #sent no aparece
+```
+
+Fíjate en la última línea: `retries` sale en el JSON porque, en ejecución, `protected` no existe y es una propiedad normal. `#sent` no sale porque es privado de verdad. Con `private` en lugar de `#` también aparecería, y además TypeScript permite leerlo con corchetes (`notifier['secret']`).
+
+**Cuándo usar cada una:**
+
+- **`#` o `private`**: el equipo elige una y la usa siempre. `#` si escribes una librería o guardas algo sensible; `private` es aceptable en código de aplicación. Mezclarlas confunde.
+- **`readonly`** siempre que no necesites reasignar. Ojo: impide `this.retries = 5`, pero no congela el contenido de un objeto o un array.
+- **`protected` y `abstract`** con moderación. Si solo quieres que varias clases tengan los mismos métodos, una `interface` y varias clases que la implementen suele ser más simple que una jerarquía.
+
+Vas a ver mucho esta abreviatura, que declara y asigna en una sola línea:
+
+```ts
+class OrderRepository {
+  constructor(private readonly tableName: string) {}
+}
+```
+
+Es válida, pero algunas configuraciones modernas (`erasableSyntaxOnly`) la prohíben porque genera código. Entiéndela, aunque en proyectos nuevos se prefiera la forma larga del ejemplo de arriba.
+
+Errores comunes y lo que dice el compilador:
+
+- `new Notifier()` → `Cannot create an instance of an abstract class.`
+- Usar `this` antes de `super()` en el constructor de una subclase → `'super' must be called before accessing 'this' in the constructor of a derived class.`
+- Leer `notifier.#sent` fuera de la clase → error de sintaxis, incluso en JavaScript puro.
+
+Ejercicio para comprobar que lo entendiste: crea una subclase `FailingNotifier` cuyo `send` lance un error, llama a `notify` dentro de un `try/catch` y verifica que `sentCount` sigue en 0. Si lo sigue, entendiste por qué el contador se incrementa **después** del `await`.""",
+            },
+        ]
+    },
+]
