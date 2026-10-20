@@ -41,7 +41,7 @@ report.xml
 *.key
 
 # Internal plan + local dev instructions (not for repo)
-.claude/
+
 .coverage
 .agents
 .codex
